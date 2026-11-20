@@ -1,0 +1,91 @@
+name: CMake builds
+
+on:
+  push:
+    branches-ignore:
+      - 'test-*'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macOS / static
+            platform_args: ""
+            build_args: -DCMAKE_BUILD_TYPE=Release -DNAETT_BUILD_SHARED=OFF
+          - os: macos-latest
+            name: macOS / shared
+            platform_args: ""
+            build_args: -DCMAKE_BUILD_TYPE=Release -DNAETT_BUILD_SHARED=ON
+          - os: windows-latest
+            name: Windows MSVC / static
+            platform_args: -A x64
+            build_args: -DNAETT_BUILD_SHARED=OFF
+          - os: windows-latest
+            name: Windows MSVC / shared
+            platform_args: -A x64
+            build_args: -DNAETT_BUILD_SHARED=ON
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build ${{ matrix.platform_args }} ${{ matrix.build_args }}
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Install
+        run: cmake --install build --config Release --prefix install
+
+      # 用安装后的 package 走一遍 find_package，验证导出配置可用
+      - name: Build consumer with find_package
+        run: |
+          cmake -S testrig/cmake-consumer -B consumer-build -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install" ${{ matrix.platform_args }}
+          cmake --build consumer-build --config Release --parallel
+
+  mingw:
+    name: Windows MinGW / static
+    runs-on: windows-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-make
+
+      - name: Configure
+        shell: msys2 {0}
+        run: cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        shell: msys2 {0}
+        run: cmake --build build --parallel
+
+      - name: Install
+        shell: msys2 {0}
+        run: cmake --install build --prefix install
+
+      - name: Build consumer with find_package
+        shell: msys2 {0}
+        run: |
+          cmake -S testrig/cmake-consumer -B consumer-build \
+            -G "MinGW Makefiles" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$(cygpath -w "$PWD/install")"
+          cmake --build consumer-build --parallel

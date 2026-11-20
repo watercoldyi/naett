@@ -13,6 +13,31 @@ On the other platforms, call with `NULL`.
 
 See `naett.h` for reference docs.
 
+## Building with CMake
+
+The CMake build currently supports Windows and macOS (Linux, iOS and Android
+are not wired up yet).
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+cmake --install build --prefix /path/to/prefix
+```
+
+`naett` is built as a static library by default; pass
+`-DNAETT_BUILD_SHARED=ON` to build a shared library instead. After
+installation, the package can be consumed with:
+
+```cmake
+find_package(naett CONFIG REQUIRED)
+target_link_libraries(myapp PRIVATE naett::naett)
+```
+
+The library can also be embedded directly via `add_subdirectory()` or
+`FetchContent`; the target is exposed as `naett::naett`.
+
+On Windows, MSVC 2019 16.8+ or MinGW is required.
+
 ## Platform implementations
 
 `naett` uses the following HTTP client libraries on each platform:
