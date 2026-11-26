@@ -42,10 +42,11 @@ elseif(APPLE)
     # macOS/iOS 后端通过 objc runtime 调用 NSURLSession。
     # 这里用 "-framework Foundation" 而不是 find_library 的绝对路径，
     # 避免导出的 CMake package 绑定到构建机上的 Xcode SDK 路径。
-    target_link_libraries(naett PUBLIC "-framework Foundation")
+    target_link_libraries(naett PUBLIC "-framework Foundation" "-framework CoreFoundation")
     # naett.h 的 countOptions 使用了 GNU 的 ({ ... }) 变参宏扩展
     target_compile_options(naett PRIVATE
         -Wall
+        -fblocks
         -Wno-gnu-zero-variadic-macro-arguments
     )
 else()
@@ -59,6 +60,9 @@ install(TARGETS naett EXPORT naettTargets
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 install(FILES naett.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+if(NAETT_BUILD_SHARED)
+    install(FILES naett.lua DESTINATION ${CMAKE_INSTALL_DATADIR}/lua/5.1)
+endif()
 
 # 导出 CMake package，安装后支持 find_package(naett CONFIG)
 include(CMakePackageConfigHelpers)

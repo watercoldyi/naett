@@ -1,6 +1,8 @@
 #ifndef LIBNAETT_H
 #define LIBNAETT_H
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -59,6 +61,39 @@ naettOption* naettUserAgent(const char *userAgent);
  */
 naettReq* naettRequestWithOptions(const char* url, int numOptions, const naettOption** options);
 
+typedef struct {
+    const char* name;
+    const char* value;
+    int valueSize;
+    const char* path;
+    const char* filename;
+    const char* contentType;
+} naettMultipartPart;
+
+#define NAETT_UNKNOWN_SOURCE_LENGTH (-2)
+
+/**
+ * Creates a streaming upload on Windows or Apple platforms. Pass either a
+ * UTF-8 bodyFile path or one or more ordered multipart parts. Each part uses
+ * either value/valueSize or a UTF-8 path/filename and optional contentType.
+ * Text and metadata are copied and files stay open until naettFree. The
+ * options are consumed. Supply an optional error code output for setup failures.
+ * The upload manages Content-Length, Transfer-Encoding and multipart Content-Type.
+ * Wait for completion before closing the response.
+ */
+naettReq* naettRequestWithUpload(const char* url, int numOptions, const naettOption** options,
+    const char* bodyFile, int numParts, const naettMultipartPart* parts, int* error);
+
+/**
+ * Creates an upload driven by naettGetUploadSourceRequest and naettSupplyUploadSource.
+ * With zero parts, sourceLengths[0] is the raw body length. Otherwise each
+ * length describes its multipart part. Use -1 for ordinary text or file parts
+ * and NAETT_UNKNOWN_SOURCE_LENGTH for a source read to EOF.
+ * A source part supplies a filename and no value or path. Options are consumed.
+ */
+naettReq* naettRequestWithSources(const char* url, int numOptions, const naettOption** options,
+    int numParts, const naettMultipartPart* parts, const int64_t* sourceLengths, int* error);
+
 /**
  * @brief Makes a request and returns a response object.
  * The actual request is processed asynchronously, use `naettComplete`
@@ -68,6 +103,40 @@ naettReq* naettRequestWithOptions(const char* url, int numOptions, const naettOp
  * there can be only one active request using the same request object.
  */
 naettRes* naettMake(naettReq* request);
+
+/** Starts a buffered response that can be cancelled on Windows and Apple platforms. */
+naettRes* naettMakeCancellable(naettReq* request);
+
+/** Cancels a cancellable response. Wait for naettComplete before closing it. */
+void naettCancel(naettRes* response);
+
+/** Snapshot before polling requests. Wait for activity after that snapshot. */
+uint64_t naettActivityVersion(void);
+void naettWaitForActivity(uint64_t version, int timeoutMS);
+
+/** Starts a response with a bounded body queue on Windows and Apple platforms. */
+naettRes* naettMakeWithSink(naettReq* request);
+
+/** Starts a response that writes successful HTTP bodies to a temporary file next to path. */
+naettRes* naettMakeWithResponseFile(naettReq* request, const char* path, int* error);
+
+/** After a completed 2xx response, publishes the file at path. Returns zero on success. */
+int naettCommitResponseFile(naettRes* response);
+
+/** Copies queued bytes. Zero means no data is available within timeoutMS. */
+int naettReadSink(naettRes* response, void* buffer, int capacity, int timeoutMS);
+
+/** Cancels a streaming download. Wait for naettComplete before closing. */
+void naettStopSink(naettRes* response);
+
+/** Returns a one-based source index, 0 on timeout or -1 when no input is currently needed. */
+int naettGetUploadSourceRequest(naettRes* response, int* capacity, uint64_t* attempt, int timeoutMS);
+
+/** Supplies one requested chunk. Zero bytes signals EOF. A stale attempt is rejected. */
+int naettSupplyUploadSource(naettRes* response, uint64_t attempt, const void* data, int size);
+
+/** Cancels a request driven by an upload source. Wait for completion before closing. */
+void naettStopUploadSource(naettRes* response);
 
 /**
  * @brief Frees a previously allocated request object.
@@ -88,6 +157,7 @@ enum naettStatus {
     naettReadError = -3,
     naettWriteError = -4,
     naettGenericError = -5,
+    naettCancelled = -6,
     naettProcessing = 0,
 };
 
@@ -98,6 +168,12 @@ enum naettStatus {
  * enum values.
  */
 int naettGetStatus(const naettRes* response);
+
+/** Returns bytes sent so far. A totalSize of UINT64_MAX means unknown. */
+uint64_t naettGetUploadProgress(const naettRes* response, uint64_t* totalSize);
+
+/** Returns response body bytes received so far. A totalSize of -1 means unknown. */
+uint64_t naettGetDownloadProgress(const naettRes* response, int64_t* totalSize);
 
 /**
  * @brief Returns the response body.

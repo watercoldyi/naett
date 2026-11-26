@@ -1,4 +1,7 @@
 #include "naett.h"
+#include "naett_sink.c"
+#include "naett_upload.c"
+#include "naett_download_file.c"
 #include "naett_core.c"
 #include "naett_osx.c"
 #include "naett_linux.c"

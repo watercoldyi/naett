@@ -1,6 +1,8 @@
 #ifndef NAETT_INTERNAL_H
 #define NAETT_INTERNAL_H
 
+#include <stdint.h>
+
 #ifdef _MSC_VER
     #define strcasecmp _stricmp
     #undef strdup
@@ -8,6 +10,9 @@
 #endif
 
 #ifdef _WIN32
+#ifndef _CRT_RAND_S
+#define _CRT_RAND_S
+#endif
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -29,8 +34,11 @@
 #endif
 
 #ifdef __APPLE__
+#include <pthread.h>
+#include <stdatomic.h>
 #include "TargetConditionals.h"
 #include <objc/objc.h>
+#include <CoreFoundation/CFStream.h>
 #if TARGET_OS_IPHONE
 #define __IOS__ 1
 #else
@@ -65,11 +73,18 @@ typedef struct {
     Buffer body;
 } RequestOptions;
 
+typedef struct UploadBody UploadBody;
+typedef struct DownloadSink DownloadSink;
+typedef struct DownloadFile DownloadFile;
+typedef struct UploadFeed UploadFeed;
+
 typedef struct {
     RequestOptions options;
     const char* url;
+    UploadBody* upload;
 #if __APPLE__
     id urlRequest;
+    id uploadFileURL;
 #endif
 #if __ANDROID__
     jobject urlObject;
@@ -80,19 +95,48 @@ typedef struct {
     HINTERNET request;
     LPWSTR host;
     LPWSTR resource;
+    int secure;
 #endif
 } InternalRequest;
 
 typedef struct {
     InternalRequest* request;
+    DownloadSink* sink;
+    DownloadFile* downloadFile;
+    UploadFeed* feed;
+    int cancellable;
     int code;
+#if __WINDOWS__
+    volatile LONG complete;
+#elif defined(__APPLE__)
+    atomic_int complete;
+#else
     int complete;
+#endif
     KVLink* headers;
     Buffer body;
+#if __WINDOWS__
+    DECLSPEC_ALIGN(8) volatile LONG64 contentLength;
+    DECLSPEC_ALIGN(8) volatile LONG64 downloadLength;
+    DECLSPEC_ALIGN(8) volatile LONG64 totalBytesRead;
+#elif defined(__APPLE__)
+    atomic_llong contentLength;
+    atomic_llong downloadLength;
+    atomic_ullong totalBytesRead;
+#else
     int contentLength;  // 0 if headers not read, -1 if Content-Length missing.
-    int totalBytesRead;
+    uint64_t totalBytesRead;
+#endif
 #if __APPLE__
     id session;
+    id task;
+    CFWriteStreamRef uploadStream;
+    pthread_t uploadWorker;
+    atomic_int uploadStop;
+    atomic_int cancelRequested;
+    atomic_ullong uploaded;
+    int uploadWorkerActive;
+    int uploadReadError;
 #endif
 #if __ANDROID__
     pthread_t workerThread;
@@ -104,6 +148,18 @@ typedef struct {
 #if __WINDOWS__
     char buffer[10240];
     size_t bytesLeft;
+    DWORD uploadSize;
+    DWORD uploadOffset;
+    DWORD uploadStart;
+    DWORD uploadPayloadStart;
+    DWORD uploadPayloadEnd;
+    int uploadEnded;
+    unsigned int uploadRetries;
+    DECLSPEC_ALIGN(8) volatile LONG64 uploaded;
+    volatile LONG streamClosing;
+    HANDLE requestStarter;
+    volatile LONG starterDone;
+    volatile LONG cancelRequested;
 #endif
 } InternalResponse;
 
@@ -112,5 +168,8 @@ int naettPlatformInitRequest(InternalRequest* req);
 void naettPlatformMakeRequest(InternalResponse* res);
 void naettPlatformFreeRequest(InternalRequest* req);
 void naettPlatformCloseResponse(InternalResponse* res);
+#if __WINDOWS__ || defined(__APPLE__)
+void naettPlatformCancel(InternalResponse* res);
+#endif
 
 #endif  // NAETT_INTERNAL_H

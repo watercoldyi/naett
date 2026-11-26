@@ -3,6 +3,7 @@
 #ifdef __APPLE__
 
 #include "naett_objc.h"
+#include <CoreFoundation/CFRunLoop.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -45,7 +46,11 @@ int naettPlatformInitRequest(InternalRequest* req) {
     id p = pool();
 
     id urlString = NSString(req->url);
-    id url = objc_msgSend_t(id, id)(class("NSURL"), sel("URLWithString:"), urlString);
+    id url = urlString == nil ? nil : objc_msgSend_t(id, id)(class("NSURL"), sel("URLWithString:"), urlString);
+    if (url == nil) {
+        release(p);
+        return 0;
+    }
 
     id request = objc_msgSend_t(id, id)(class("NSMutableURLRequest"), sel("requestWithURL:"), url);
 
@@ -70,7 +75,21 @@ int naettPlatformInitRequest(InternalRequest* req) {
     char byteBuffer[10240];
     int bytesRead = 0;
 
-    if (req->options.bodyReader != NULL) {
+    if (req->upload) {
+        if (req->upload->filePath) {
+            id path = NSString(req->upload->filePath);
+            if (path == nil) {
+                release(p);
+                return 0;
+            }
+            req->uploadFileURL = objc_msgSend_t(id, id)(class("NSURL"), sel("fileURLWithPath:"), path);
+            if (req->uploadFileURL == nil) {
+                release(p);
+                return 0;
+            }
+            retain(req->uploadFileURL);
+        }
+    } else if (req->options.bodyReader != NULL) {
         id bodyData =
             objc_msgSend_t(id, NSUInteger)(class("NSMutableData"), sel("dataWithCapacity:"), sizeof(byteBuffer));
 
@@ -93,18 +112,12 @@ int naettPlatformInitRequest(InternalRequest* req) {
     return 1;
 }
 
-void didReceiveData(id self, SEL _sel, id session, id dataTask, id data) {
-    InternalResponse* res = NULL;
-    id p = pool();
+static void readResponseHeaders(InternalResponse* res, id response) {
+    res->code = objc_msgSend_t(NSInteger)(response, sel("statusCode"));
+    id allHeaders = objc_msgSend_t(id)(response, sel("allHeaderFields"));
 
-    object_getInstanceVariable(self, "response", (void**)&res);
-
-    if (res->headers == NULL) {
-        id response = objc_msgSend_t(id)(dataTask, sel("response"));
-        res->code = objc_msgSend_t(NSInteger)(response, sel("statusCode"));
-        id allHeaders = objc_msgSend_t(id)(response, sel("allHeaderFields"));
-
-        NSUInteger headerCount = objc_msgSend_t(NSUInteger)(allHeaders, sel("count"));
+    NSUInteger headerCount = objc_msgSend_t(NSUInteger)(allHeaders, sel("count"));
+    if (headerCount > 0) {
         id headerNames[headerCount];
         id headerValues[headerCount];
 
@@ -119,30 +132,195 @@ void didReceiveData(id self, SEL _sel, id session, id dataTask, id data) {
             firstHeader = node;
         }
         res->headers = firstHeader;
-
-        const char* contentLength = naettGetHeader((naettRes*)res, "Content-Length");
-        if (!contentLength || sscanf(contentLength, "%d", &res->contentLength) != 1) {
-            res->contentLength = -1;
-        }
     }
 
-    const void* bytes = objc_msgSend_t(const void*)(data, sel("bytes"));
+    readResponseLength(res);
+}
+
+static void didReceiveResponse(id self, SEL _sel, id session, id dataTask, id response, void (^reply)(NSInteger)) {
+    InternalResponse* res = NULL;
+    object_getInstanceVariable(self, "response", (void**)&res);
+    if (res && res->code == naettProcessing) {
+        id p = pool();
+        readResponseHeaders(res, response);
+        release(p);
+    }
+    reply(1); // NSURLSessionResponseAllow
+}
+
+void didReceiveData(id self, SEL _sel, id session, id dataTask, id data) {
+    InternalResponse* res = NULL;
+    id p = pool();
+
+    object_getInstanceVariable(self, "response", (void**)&res);
+
+    if (res->code == naettProcessing) {
+        readResponseHeaders(res, objc_msgSend_id(dataTask, sel("response")));
+    }
+
+    const unsigned char* bytes = objc_msgSend_t(const unsigned char*)(data, sel("bytes"));
     NSUInteger length = objc_msgSend_t(NSUInteger)(data, sel("length"));
 
-    res->request->options.bodyWriter(bytes, length, res->request->options.bodyWriterData);
-    res->totalBytesRead += (int)length;
+    while (length > 0) {
+        int count = length > INT_MAX ? INT_MAX : (int)length;
+        if (writeResponseBody(res, bytes, count) != count && (res->sink || res->downloadFile)) {
+            res->code = naettWriteError;
+            objc_msgSend_void(dataTask, sel("cancel"));
+            break;
+        }
+        recordResponseBytes(res, count);
+        bytes += count;
+        length -= (NSUInteger)count;
+    }
 
     release(p);
+}
+
+typedef struct {
+    InternalResponse* response;
+    char buffer[16384];
+    int size;
+    int offset;
+    int done;
+} UploadPump;
+
+static void pumpUploadStream(CFWriteStreamRef stream, CFStreamEventType event, void* context) {
+    UploadPump* pump = context;
+    InternalResponse* res = pump->response;
+    if (event != kCFStreamEventCanAcceptBytes) {
+        pump->done = 1;
+        return;
+    }
+    while (!pump->done && !atomic_load_explicit(&res->uploadStop, memory_order_relaxed) &&
+        CFWriteStreamCanAcceptBytes(stream)) {
+        if (pump->offset == pump->size) {
+            pump->size = readUpload(res, pump->buffer, sizeof(pump->buffer));
+            if (pump->size <= 0) {
+                res->uploadReadError = pump->size < 0 &&
+                    !atomic_load_explicit(&res->uploadStop, memory_order_relaxed);
+                pump->done = 1;
+                break;
+            }
+            pump->offset = 0;
+        }
+        CFIndex written = CFWriteStreamWrite(stream, (const UInt8*)pump->buffer + pump->offset,
+            pump->size - pump->offset);
+        if (written <= 0) {
+            pump->done = 1;
+            break;
+        }
+        pump->offset += (int)written;
+    }
+}
+
+static void* writeUploadStream(void* context) {
+    InternalResponse* res = context;
+    CFWriteStreamRef stream = res->uploadStream;
+    UploadPump pump = { .response = res };
+    CFStreamClientContext client = { .info = &pump };
+    CFOptionFlags events = kCFStreamEventCanAcceptBytes | kCFStreamEventErrorOccurred | kCFStreamEventEndEncountered;
+    if (CFWriteStreamSetClient(stream, events, pumpUploadStream, &client)) {
+        CFRunLoopRef runLoop = CFRunLoopGetCurrent();
+        CFWriteStreamScheduleWithRunLoop(stream, runLoop, kCFRunLoopDefaultMode);
+        if (CFWriteStreamOpen(stream)) {
+            while (!pump.done && !atomic_load_explicit(&res->uploadStop, memory_order_relaxed)) {
+                if (CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.02, true) == kCFRunLoopRunFinished) {
+                    break;
+                }
+            }
+        }
+        CFWriteStreamUnscheduleFromRunLoop(stream, runLoop, kCFRunLoopDefaultMode);
+        CFWriteStreamSetClient(stream, 0, NULL, NULL);
+    }
+    CFWriteStreamClose(stream);
+    return NULL;
+}
+
+static void stopUploadStream(InternalResponse* res) {
+    if (res->uploadWorkerActive) {
+        atomic_store_explicit(&res->uploadStop, 1, memory_order_relaxed);
+        changeFeed(res->feed, FeedInterrupt);
+        pthread_join(res->uploadWorker, NULL);
+        res->uploadWorkerActive = 0;
+        CFRelease(res->uploadStream);
+        res->uploadStream = NULL;
+    }
+}
+
+static void needNewBodyStream(id self, SEL _sel, id session, id task, void (^reply)(id)) {
+    InternalResponse* res = NULL;
+    object_getInstanceVariable(self, "response", (void**)&res);
+    if (!res || !res->request->upload) {
+        reply(nil);
+        return;
+    }
+
+    stopUploadStream(res);
+    if (res->uploadReadError || !resetUpload(res)) {
+        res->uploadReadError = 1;
+        reply(nil);
+        return;
+    }
+    atomic_store_explicit(&res->uploaded, 0, memory_order_relaxed);
+
+    CFReadStreamRef input = NULL;
+    CFWriteStreamRef output = NULL;
+    CFStreamCreateBoundPair(NULL, &input, &output, 16384);
+    if (input && output) {
+        res->uploadStream = output;
+        atomic_store_explicit(&res->uploadStop, 0, memory_order_relaxed);
+        if (pthread_create(&res->uploadWorker, NULL, writeUploadStream, res) == 0) {
+            res->uploadWorkerActive = 1;
+            reply((id)input);
+            CFRelease(input);
+            return;
+        }
+        res->uploadStream = NULL;
+    }
+    if (input) {
+        CFRelease(input);
+    }
+    if (output) {
+        CFRelease(output);
+    }
+    res->code = naettGenericError;
+    reply(nil);
+}
+
+static void didSendBodyData(id self, SEL _sel, id session, id task, int64_t bytesSent,
+    int64_t totalBytesSent, int64_t totalBytesExpected) {
+    InternalResponse* res = NULL;
+    object_getInstanceVariable(self, "response", (void**)&res);
+    if (res && res->request->upload && totalBytesSent >= 0) {
+        uint64_t sent = (uint64_t)totalBytesSent;
+        UploadBody* upload = res->request->upload;
+        atomic_store_explicit(&res->uploaded, upload->unknownSize || sent < upload->size ? sent : upload->size,
+            memory_order_relaxed);
+        if (res->cancellable) {
+            signalActivity();
+        }
+    }
 }
 
 static void didComplete(id self, SEL _sel, id session, id dataTask, id error) {
     InternalResponse* res = NULL;
     object_getInstanceVariable(self, "response", (void**)&res);
     if (res != NULL) {
-        if (error != nil) {
+        stopUploadStream(res);
+        if (res->sink && sinkStopped(res->sink)) {
+            res->code = naettWriteError;
+        } else if (atomic_load_explicit(&res->cancelRequested, memory_order_acquire)) {
+            res->code = naettCancelled;
+        } else if (res->uploadReadError) {
+            res->code = naettReadError;
+        } else if (error != nil && res->code >= 0) {
             res->code = naettConnectionError;
+        } else if (res->code == naettProcessing) {
+            id p = pool();
+            readResponseHeaders(res, objc_msgSend_id(dataTask, sel("response")));
+            release(p);
         }
-        res->complete = 1;
+        finishResponse(res);
     }
 }
 
@@ -153,8 +331,13 @@ static id createDelegate(void) {
         TaskDelegateClass = objc_allocateClassPair((Class)objc_getClass("NSObject"), "naettTaskDelegate", 0);
         class_addProtocol(TaskDelegateClass, (Protocol* _Nonnull)objc_getProtocol("NSURLSessionDataDelegate"));
 
+        addMethod(TaskDelegateClass, "URLSession:dataTask:didReceiveResponse:completionHandler:",
+            didReceiveResponse, "v@:@@@@?");
         addMethod(TaskDelegateClass, "URLSession:dataTask:didReceiveData:", didReceiveData, "v@:@@@");
         addMethod(TaskDelegateClass, "URLSession:task:didCompleteWithError:", didComplete, "v@:@@@");
+        addMethod(TaskDelegateClass, "URLSession:task:needNewBodyStream:", needNewBodyStream, "v@:@@@?");
+        addMethod(TaskDelegateClass, "URLSession:task:didSendBodyData:totalBytesSent:totalBytesExpectedToSend:",
+            didSendBodyData, "v@:@@qqq");
         addIvar(TaskDelegateClass, "response", sizeof(void*), "^v");
     }
 
@@ -179,9 +362,27 @@ void naettPlatformMakeRequest(InternalResponse* res) {
         delegate,
         nil);
 
+    retain(session);
     res->session = session;
 
-    id task = objc_msgSend_t(id, id)(session, sel("dataTaskWithRequest:"), req->urlRequest);
+    id task;
+    if (req->uploadFileURL) {
+        task = objc_msgSend_t(id, id, id)(session, sel("uploadTaskWithRequest:fromFile:"),
+            req->urlRequest, req->uploadFileURL);
+    } else {
+        SEL taskMethod = req->upload ? sel("uploadTaskWithStreamedRequest:") : sel("dataTaskWithRequest:");
+        task = objc_msgSend_t(id, id)(session, taskMethod, req->urlRequest);
+    }
+    if (task == nil) {
+        res->code = naettGenericError;
+        release(p);
+        finishResponse(res);
+        return;
+    }
+    if (res->cancellable) {
+        retain(task);
+        res->task = task;
+    }
     objc_msgSend_void(task, sel("resume"));
 
     release(p);
@@ -190,11 +391,20 @@ void naettPlatformMakeRequest(InternalResponse* res) {
 void naettPlatformFreeRequest(InternalRequest* req) {
     release(req->urlRequest);
     req->urlRequest = nil;
+    release(req->uploadFileURL);
+    req->uploadFileURL = nil;
 }
 
 void naettPlatformCloseResponse(InternalResponse* res) {
     objc_msgSend_void(res->session, sel("invalidateAndCancel"));
+    release(res->task);
+    release(res->session);
     res->session = nil;
+}
+
+void naettPlatformCancel(InternalResponse* res) {
+    atomic_store_explicit(&res->cancelRequested, 1, memory_order_release);
+    objc_msgSend_void(res->task, sel("cancel"));
 }
 
 #endif  // __APPLE__

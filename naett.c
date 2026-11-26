@@ -1,9 +1,11 @@
 // Inlined amalgam.h: //
 #include "naett.h"
-// Inlined naett_core.c: //
+// Inlined naett_sink.c: //
 // Inlined naett_internal.h: //
 #ifndef NAETT_INTERNAL_H
 #define NAETT_INTERNAL_H
+
+#include <stdint.h>
 
 #ifdef _MSC_VER
     #define strcasecmp _stricmp
@@ -12,6 +14,9 @@
 #endif
 
 #ifdef _WIN32
+#ifndef _CRT_RAND_S
+#define _CRT_RAND_S
+#endif
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -33,8 +38,11 @@
 #endif
 
 #ifdef __APPLE__
+#include <pthread.h>
+#include <stdatomic.h>
 #include "TargetConditionals.h"
 #include <objc/objc.h>
+#include <CoreFoundation/CFStream.h>
 #if TARGET_OS_IPHONE
 #define __IOS__ 1
 #else
@@ -69,11 +77,18 @@ typedef struct {
     Buffer body;
 } RequestOptions;
 
+typedef struct UploadBody UploadBody;
+typedef struct DownloadSink DownloadSink;
+typedef struct DownloadFile DownloadFile;
+typedef struct UploadFeed UploadFeed;
+
 typedef struct {
     RequestOptions options;
     const char* url;
+    UploadBody* upload;
 #if __APPLE__
     id urlRequest;
+    id uploadFileURL;
 #endif
 #if __ANDROID__
     jobject urlObject;
@@ -84,19 +99,48 @@ typedef struct {
     HINTERNET request;
     LPWSTR host;
     LPWSTR resource;
+    int secure;
 #endif
 } InternalRequest;
 
 typedef struct {
     InternalRequest* request;
+    DownloadSink* sink;
+    DownloadFile* downloadFile;
+    UploadFeed* feed;
+    int cancellable;
     int code;
+#if __WINDOWS__
+    volatile LONG complete;
+#elif defined(__APPLE__)
+    atomic_int complete;
+#else
     int complete;
+#endif
     KVLink* headers;
     Buffer body;
+#if __WINDOWS__
+    DECLSPEC_ALIGN(8) volatile LONG64 contentLength;
+    DECLSPEC_ALIGN(8) volatile LONG64 downloadLength;
+    DECLSPEC_ALIGN(8) volatile LONG64 totalBytesRead;
+#elif defined(__APPLE__)
+    atomic_llong contentLength;
+    atomic_llong downloadLength;
+    atomic_ullong totalBytesRead;
+#else
     int contentLength;  // 0 if headers not read, -1 if Content-Length missing.
-    int totalBytesRead;
+    uint64_t totalBytesRead;
+#endif
 #if __APPLE__
     id session;
+    id task;
+    CFWriteStreamRef uploadStream;
+    pthread_t uploadWorker;
+    atomic_int uploadStop;
+    atomic_int cancelRequested;
+    atomic_ullong uploaded;
+    int uploadWorkerActive;
+    int uploadReadError;
 #endif
 #if __ANDROID__
     pthread_t workerThread;
@@ -108,6 +152,18 @@ typedef struct {
 #if __WINDOWS__
     char buffer[10240];
     size_t bytesLeft;
+    DWORD uploadSize;
+    DWORD uploadOffset;
+    DWORD uploadStart;
+    DWORD uploadPayloadStart;
+    DWORD uploadPayloadEnd;
+    int uploadEnded;
+    unsigned int uploadRetries;
+    DECLSPEC_ALIGN(8) volatile LONG64 uploaded;
+    volatile LONG streamClosing;
+    HANDLE requestStarter;
+    volatile LONG starterDone;
+    volatile LONG cancelRequested;
 #endif
 } InternalResponse;
 
@@ -116,15 +172,879 @@ int naettPlatformInitRequest(InternalRequest* req);
 void naettPlatformMakeRequest(InternalResponse* res);
 void naettPlatformFreeRequest(InternalRequest* req);
 void naettPlatformCloseResponse(InternalResponse* res);
+#if __WINDOWS__ || defined(__APPLE__)
+void naettPlatformCancel(InternalResponse* res);
+#endif
 
 #endif  // NAETT_INTERNAL_H
 // End of inlined naett_internal.h //
 
+
+#if __WINDOWS__ || defined(__APPLE__)
+
+#include <stdlib.h>
+#include <string.h>
+#if __APPLE__
+#include <time.h>
+#endif
+
+#if __WINDOWS__
+typedef CRITICAL_SECTION SinkMutex;
+typedef CONDITION_VARIABLE SinkCondition;
+#define sinkLock EnterCriticalSection
+#define sinkUnlock LeaveCriticalSection
+#define sinkSignal WakeAllConditionVariable
+#else
+typedef pthread_mutex_t SinkMutex;
+typedef pthread_cond_t SinkCondition;
+#define sinkLock pthread_mutex_lock
+#define sinkUnlock pthread_mutex_unlock
+#define sinkSignal pthread_cond_broadcast
+#endif
+
+static void waitForStream(SinkCondition* condition, SinkMutex* mutex, int timeoutMS) {
+#if __WINDOWS__
+    SleepConditionVariableCS(condition, mutex, timeoutMS < 0 ? INFINITE : (DWORD)timeoutMS);
+#else
+    if (timeoutMS < 0) {
+        pthread_cond_wait(condition, mutex);
+        return;
+    }
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_REALTIME, &deadline) == 0) {
+        deadline.tv_sec += timeoutMS / 1000;
+        deadline.tv_nsec += (timeoutMS % 1000) * 1000000L;
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec++;
+            deadline.tv_nsec -= 1000000000L;
+        }
+        pthread_cond_timedwait(condition, mutex, &deadline);
+    }
+#endif
+}
+
+#if __WINDOWS__
+static SRWLOCK activityMutex = SRWLOCK_INIT;
+static CONDITION_VARIABLE activityChanged = CONDITION_VARIABLE_INIT;
+#define activityLock() AcquireSRWLockExclusive(&activityMutex)
+#define activityUnlock() ReleaseSRWLockExclusive(&activityMutex)
+#else
+static pthread_mutex_t activityMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t activityChanged = PTHREAD_COND_INITIALIZER;
+#define activityLock() pthread_mutex_lock(&activityMutex)
+#define activityUnlock() pthread_mutex_unlock(&activityMutex)
+#endif
+static uint64_t activityVersion;
+
+static void signalActivity(void) {
+    activityLock();
+    activityVersion++;
+    sinkSignal(&activityChanged);
+    activityUnlock();
+}
+
+static uint64_t getActivityVersion(void) {
+    activityLock();
+    uint64_t version = activityVersion;
+    activityUnlock();
+    return version;
+}
+
+static void waitForActivity(uint64_t version, int timeoutMS) {
+    activityLock();
+    if (version == activityVersion && timeoutMS > 0) {
+#if __WINDOWS__
+        SleepConditionVariableSRW(&activityChanged, &activityMutex, (DWORD)timeoutMS, 0);
+#else
+        waitForStream(&activityChanged, &activityMutex, timeoutMS);
+#endif
+    }
+    activityUnlock();
+}
+
+struct DownloadSink {
+    SinkMutex mutex;
+    SinkCondition readable;
+    SinkCondition writable;
+    unsigned char buffer[65536];
+    int offset;
+    int size;
+    int finished;
+    int stopped;
+};
+
+static DownloadSink* createSink(void) {
+    DownloadSink* sink = calloc(1, sizeof(*sink));
+    if (!sink) {
+        return NULL;
+    }
+#if __WINDOWS__
+    InitializeCriticalSection(&sink->mutex);
+    InitializeConditionVariable(&sink->readable);
+    InitializeConditionVariable(&sink->writable);
+#else
+    if (pthread_mutex_init(&sink->mutex, NULL) != 0) {
+        free(sink);
+        return NULL;
+    }
+    if (pthread_cond_init(&sink->readable, NULL) != 0) {
+        pthread_mutex_destroy(&sink->mutex);
+        free(sink);
+        return NULL;
+    }
+    if (pthread_cond_init(&sink->writable, NULL) != 0) {
+        pthread_cond_destroy(&sink->readable);
+        pthread_mutex_destroy(&sink->mutex);
+        free(sink);
+        return NULL;
+    }
+#endif
+    return sink;
+}
+
+static void freeSink(DownloadSink* sink) {
+    if (sink) {
+#if __WINDOWS__
+        DeleteCriticalSection(&sink->mutex);
+#else
+        pthread_cond_destroy(&sink->writable);
+        pthread_cond_destroy(&sink->readable);
+        pthread_mutex_destroy(&sink->mutex);
+#endif
+        free(sink);
+    }
+}
+
+static void finishSink(DownloadSink* sink) {
+    sinkLock(&sink->mutex);
+    sink->finished = 1;
+    sinkSignal(&sink->readable);
+    sinkUnlock(&sink->mutex);
+}
+
+static void stopSink(DownloadSink* sink) {
+    sinkLock(&sink->mutex);
+    sink->stopped = 1;
+    sink->size = 0;
+    sinkSignal(&sink->writable);
+    sinkSignal(&sink->readable);
+    sinkUnlock(&sink->mutex);
+}
+
+static int sinkStopped(DownloadSink* sink) {
+    sinkLock(&sink->mutex);
+    int stopped = sink->stopped;
+    sinkUnlock(&sink->mutex);
+    return stopped;
+}
+
+static int writeSink(DownloadSink* sink, const void* source, int bytes) {
+    const unsigned char* data = source;
+    int copied = 0;
+    sinkLock(&sink->mutex);
+    while (copied < bytes) {
+        while (sink->size != 0 && !sink->stopped) {
+            waitForStream(&sink->writable, &sink->mutex, -1);
+        }
+        if (sink->stopped) {
+            sinkUnlock(&sink->mutex);
+            return -1;
+        }
+        int count = bytes - copied;
+        if (count > (int)sizeof(sink->buffer)) {
+            count = (int)sizeof(sink->buffer);
+        }
+        memcpy(sink->buffer, data + copied, (size_t)count);
+        copied += count;
+        sink->offset = 0;
+        sink->size = count;
+        sinkSignal(&sink->readable);
+        signalActivity();
+    }
+    sinkUnlock(&sink->mutex);
+    return copied;
+}
+
+static int readSink(DownloadSink* sink, void* dest, int capacity, int timeoutMS) {
+    sinkLock(&sink->mutex);
+    if (sink->size == 0 && !sink->finished && !sink->stopped && timeoutMS > 0) {
+        waitForStream(&sink->readable, &sink->mutex, timeoutMS);
+    }
+    int count = capacity < sink->size ? capacity : sink->size;
+    if (count > 0) {
+        memcpy(dest, sink->buffer + sink->offset, (size_t)count);
+        sink->offset += count;
+        sink->size -= count;
+        if (sink->size == 0) {
+            sinkSignal(&sink->writable);
+        }
+    }
+    sinkUnlock(&sink->mutex);
+    return count;
+}
+
+struct UploadFeed {
+    SinkMutex mutex;
+    SinkCondition changed;
+    uint64_t attempt;
+    void* buffer;
+    int capacity;
+    int index;
+    int supplied;
+    int finished;
+    int stopped;
+};
+
+static UploadFeed* createFeed(void) {
+    UploadFeed* feed = calloc(1, sizeof(*feed));
+    if (!feed) {
+        return NULL;
+    }
+#if __WINDOWS__
+    InitializeCriticalSection(&feed->mutex);
+    InitializeConditionVariable(&feed->changed);
+#else
+    if (pthread_mutex_init(&feed->mutex, NULL) != 0) {
+        free(feed);
+        return NULL;
+    }
+    if (pthread_cond_init(&feed->changed, NULL) != 0) {
+        pthread_mutex_destroy(&feed->mutex);
+        free(feed);
+        return NULL;
+    }
+#endif
+    return feed;
+}
+
+static void freeFeed(UploadFeed* feed) {
+    if (feed) {
+#if __WINDOWS__
+        DeleteCriticalSection(&feed->mutex);
+#else
+        pthread_cond_destroy(&feed->changed);
+        pthread_mutex_destroy(&feed->mutex);
+#endif
+        free(feed);
+    }
+}
+
+typedef enum { FeedRestart, FeedInterrupt, FeedCancel } FeedChange;
+
+static void changeFeed(UploadFeed* feed, FeedChange change) {
+    if (feed) {
+        sinkLock(&feed->mutex);
+        feed->attempt++;
+        feed->buffer = NULL;
+        feed->finished = change != FeedRestart;
+        feed->stopped |= change == FeedCancel;
+        sinkSignal(&feed->changed);
+        sinkUnlock(&feed->mutex);
+    }
+}
+
+static void finishFeed(UploadFeed* feed) {
+    if (feed) {
+        sinkLock(&feed->mutex);
+        feed->finished = 1;
+        sinkSignal(&feed->changed);
+        sinkUnlock(&feed->mutex);
+    }
+}
+
+static int readFeed(UploadFeed* feed, int index, void* buffer, int capacity) {
+    sinkLock(&feed->mutex);
+    int count = -1;
+    if (!feed->stopped && !feed->finished) {
+        uint64_t attempt = feed->attempt;
+        feed->buffer = buffer;
+        feed->capacity = capacity;
+        feed->index = index;
+        sinkSignal(&feed->changed);
+        signalActivity();
+        while (feed->buffer && feed->attempt == attempt) {
+            waitForStream(&feed->changed, &feed->mutex, -1);
+        }
+        if (feed->attempt == attempt) {
+            count = feed->supplied;
+        }
+    }
+    sinkUnlock(&feed->mutex);
+    return count;
+}
+
+static int requestFeed(UploadFeed* feed, int* capacity, uint64_t* attempt, int timeoutMS) {
+    sinkLock(&feed->mutex);
+    if (!feed->buffer && !feed->finished && !feed->stopped && timeoutMS > 0) {
+        waitForStream(&feed->changed, &feed->mutex, timeoutMS);
+    }
+    int index = feed->finished || feed->stopped ? -1 : 0;
+    if (feed->buffer) {
+        index = feed->index;
+        *capacity = feed->capacity;
+        *attempt = feed->attempt;
+    }
+    sinkUnlock(&feed->mutex);
+    return index;
+}
+
+static int supplyFeed(UploadFeed* feed, uint64_t attempt, const void* data, int size) {
+    sinkLock(&feed->mutex);
+    int accepted = feed->buffer && attempt == feed->attempt && size >= 0 && size <= feed->capacity &&
+        (size == 0 || data);
+    if (accepted) {
+        if (size > 0) {
+            memcpy(feed->buffer, data, (size_t)size);
+        }
+        feed->supplied = size;
+        feed->buffer = NULL;
+        sinkSignal(&feed->changed);
+    }
+    sinkUnlock(&feed->mutex);
+    return accepted;
+}
+
+#endif
+// End of inlined naett_sink.c //
+
+// Inlined naett_upload.c: //
+//#include "naett_internal.h"
+
+#if __WINDOWS__ || defined(__APPLE__)
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#if __WINDOWS__
+#include <share.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
+typedef struct {
+    FILE* file;
+    char* data;
+    uint64_t size;
+    int source;
+    int unknownSize;
+} UploadSegment;
+
+struct UploadBody {
+    UploadSegment* segments;
+#if __APPLE__
+    char* filePath;
+#endif
+    size_t count;
+    size_t index;
+    uint64_t offset;
+    uint64_t size;
+    int hasSource;
+    int unknownSize;
+};
+
+#if __WINDOWS__
+static wchar_t* winPathFromUTF8(const char* path) {
+    int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
+    if (length == 0) {
+        return NULL;
+    }
+    wchar_t* widePath = malloc((size_t)length * sizeof(wchar_t));
+    if (!widePath) {
+        return NULL;
+    }
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, widePath, length)) {
+        free(widePath);
+        return NULL;
+    }
+    return widePath;
+}
+#endif
+
+static FILE* openUploadFile(const char* path, uint64_t* size) {
+#if __WINDOWS__
+    wchar_t* widePath = winPathFromUTF8(path);
+    FILE* file = widePath ? _wfsopen(widePath, L"rb", _SH_DENYWR) : NULL;
+    free(widePath);
+    struct _stat64 info;
+    int valid = file && _fstat64(_fileno(file), &info) == 0 && (info.st_mode & _S_IFMT) == _S_IFREG;
+#else
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd == -1) {
+        return NULL;
+    }
+    FILE* file = fdopen(fd, "rb");
+    if (!file) {
+        close(fd);
+        return NULL;
+    }
+    struct stat info;
+    int valid = fstat(fd, &info) == 0 && S_ISREG(info.st_mode);
+#endif
+    if (!valid || info.st_size < 0) {
+        if (file) {
+            fclose(file);
+        }
+        return NULL;
+    }
+    *size = (uint64_t)info.st_size;
+    return file;
+}
+
+static void freeUpload(UploadBody* upload) {
+    if (upload) {
+        for (size_t i = 0; i < upload->count; i++) {
+            UploadSegment* segment = &upload->segments[i];
+            if (segment->file) {
+                fclose(segment->file);
+            }
+            free(segment->data);
+        }
+        free(upload->segments);
+#if __APPLE__
+        free(upload->filePath);
+#endif
+        free(upload);
+    }
+}
+
+static int uploadSegment(UploadBody* upload, FILE* file, char* data, uint64_t size) {
+    upload->segments[upload->count++] = (UploadSegment){ file, data, size, 0, 0 };
+    if (size > INT64_MAX - upload->size) {
+        return naettGenericError;
+    }
+    upload->size += size;
+    return 0;
+}
+
+static int uploadSource(UploadBody* upload, int index, int64_t size) {
+    int unknown = size == NAETT_UNKNOWN_SOURCE_LENGTH;
+    if (size < 0 && !unknown) {
+        return naettProtocolError;
+    }
+    int error = uploadSegment(upload, NULL, NULL, unknown ? 0 : (uint64_t)size);
+    UploadSegment* segment = &upload->segments[upload->count - 1];
+    segment->source = index;
+    segment->unknownSize = unknown;
+    upload->hasSource = 1;
+    upload->unknownSize |= unknown;
+    return error;
+}
+
+static int uploadFile(UploadBody* upload, const char* path) {
+    uint64_t size;
+    FILE* file = openUploadFile(path, &size);
+    return file ? uploadSegment(upload, file, NULL, size) : naettReadError;
+}
+
+static int uploadMemory(UploadBody* upload, const char* data, size_t size) {
+    char* copy = size ? malloc(size) : NULL;
+    if (size && !copy) {
+        return naettGenericError;
+    }
+    if (size) {
+        memcpy(copy, data, size);
+    }
+    return uploadSegment(upload, NULL, copy, size);
+}
+
+static int validPartHeader(const char* value) {
+    if (!value || !*value) {
+        return 0;
+    }
+    for (const unsigned char* p = (const unsigned char*)value; *p; p++) {
+        if (*p < 32 || *p == 127) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static char* escapePartParameter(const char* value) {
+    size_t length = strlen(value);
+    if (length > (SIZE_MAX - 1) / 2) {
+        return NULL;
+    }
+    char* result = malloc(length * 2 + 1);
+    if (result) {
+        char* out = result;
+        for (; *value; value++) {
+            if (*value == '\\' || *value == '"') {
+                *out++ = '\\';
+            }
+            *out++ = *value;
+        }
+        *out = 0;
+    }
+    return result;
+}
+
+static int uploadPart(UploadBody* upload, const char* boundary, const naettMultipartPart* part,
+    int index, int64_t sourceLength) {
+    int sourcePart = sourceLength >= 0 || sourceLength == NAETT_UNKNOWN_SOURCE_LENGTH;
+    int filePart = part->path != NULL || sourcePart;
+    const char* contentType = part->contentType ? part->contentType : "application/octet-stream";
+    if ((!sourcePart && sourceLength != -1) || !validPartHeader(part->name) ||
+        (part->path && (!*part->path || sourcePart)) || (filePart && (part->value ||
+        !validPartHeader(part->filename) || !validPartHeader(contentType))) ||
+        (!filePart && (!part->value || part->valueSize < 0 || part->filename || part->contentType))) {
+        return naettProtocolError;
+    }
+
+    char* name = escapePartParameter(part->name);
+    char* filename = filePart ? escapePartParameter(part->filename) : NULL;
+    const char* format = filePart
+        ? "--%s\r\nContent-Disposition: form-data; name=\"%s\"; filename=\"%s\"\r\nContent-Type: %s\r\n\r\n"
+        : "--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n";
+    int length = name && (!filePart || filename) ? snprintf(NULL, 0, format, boundary, name, filename, contentType) : -1;
+    char* header = length >= 0 ? malloc((size_t)length + 1) : NULL;
+    if (header) {
+        snprintf(header, (size_t)length + 1, format, boundary, name, filename, contentType);
+    }
+    free(filename);
+    free(name);
+    if (!header) {
+        return naettGenericError;
+    }
+
+    int error = uploadSegment(upload, NULL, header, (size_t)length);
+    if (!error) {
+        if (sourcePart) {
+            error = uploadSource(upload, index, sourceLength);
+        } else {
+            error = part->path ? uploadFile(upload, part->path) : uploadMemory(upload, part->value, part->valueSize);
+        }
+    }
+    return error ? error : uploadMemory(upload, "\r\n", 2);
+}
+
+static int prepareUpload(InternalRequest* req, const char* bodyFile, int count,
+    const naettMultipartPart* parts, const int64_t* sourceLengths, char* contentType, size_t contentTypeSize) {
+    int rawSource = sourceLengths && count == 0 && !parts;
+    if ((bodyFile && (!*bodyFile || count != 0 || parts || sourceLengths)) ||
+        (!bodyFile && !rawSource && (count <= 0 || !parts)) ||
+        req->options.bodyReader || req->options.body.data || req->options.body.size != 0) {
+        return naettProtocolError;
+    }
+    for (KVLink* header = req->options.headers; header; header = header->next) {
+        if (strcasecmp(header->key, "Content-Length") == 0 || strcasecmp(header->key, "Transfer-Encoding") == 0 ||
+            (parts && strcasecmp(header->key, "Content-Type") == 0)) {
+            return naettProtocolError;
+        }
+    }
+    if ((size_t)count > (SIZE_MAX / sizeof(UploadSegment) - 1) / 3) {
+        return naettGenericError;
+    }
+    UploadBody* upload = calloc(1, sizeof(*upload));
+    if (!upload) {
+        return naettGenericError;
+    }
+    req->upload = upload;
+    upload->segments = calloc((size_t)count * 3 + 1, sizeof(*upload->segments));
+    if (!upload->segments) {
+        return naettGenericError;
+    }
+    if (bodyFile) {
+#if __APPLE__
+        upload->filePath = strdup(bodyFile);
+        if (!upload->filePath) {
+            return naettGenericError;
+        }
+#endif
+        return uploadFile(upload, bodyFile);
+    }
+    if (rawSource) {
+        return uploadSource(upload, 1, sourceLengths[0]);
+    }
+
+    unsigned int random[4];
+#if __WINDOWS__
+    for (int i = 0; i < 4; i++) {
+        if (rand_s(&random[i]) != 0) {
+            return naettGenericError;
+        }
+    }
+#else
+    arc4random_buf(random, sizeof(random));
+#endif
+    char boundary[40];
+    snprintf(boundary, sizeof(boundary), "naett-%08x%08x%08x%08x", random[0], random[1], random[2], random[3]);
+    for (int i = 0; i < count; i++) {
+        int error = uploadPart(upload, boundary, &parts[i], i + 1, sourceLengths ? sourceLengths[i] : -1);
+        if (error) {
+            return error;
+        }
+    }
+    char end[sizeof(boundary) + 6];
+    int length = snprintf(end, sizeof(end), "--%s--\r\n", boundary);
+    snprintf(contentType, contentTypeSize, "multipart/form-data; boundary=%s", boundary);
+    return uploadMemory(upload, end, (size_t)length);
+}
+
+static int resetUpload(InternalResponse* res) {
+    UploadBody* upload = res->request->upload;
+    for (size_t i = 0; i < upload->count; i++) {
+        FILE* file = upload->segments[i].file;
+        if (file) {
+            clearerr(file);
+#if __WINDOWS__
+            if (_fseeki64(file, 0, SEEK_SET) != 0) {
+#else
+            if (fseeko(file, 0, SEEK_SET) != 0) {
+#endif
+                return 0;
+            }
+        }
+    }
+    upload->index = 0;
+    upload->offset = 0;
+    changeFeed(res->feed, FeedRestart);
+    return 1;
+}
+
+static int readUpload(InternalResponse* res, char* buffer, int capacity) {
+    UploadBody* upload = res->request->upload;
+    int total = 0;
+    while (total < capacity && upload->index < upload->count) {
+        UploadSegment* segment = &upload->segments[upload->index];
+        int length = capacity - total;
+        if (!segment->unknownSize && segment->size - upload->offset < (uint64_t)length) {
+            length = (int)(segment->size - upload->offset);
+        }
+        if (length > 0) {
+            if (segment->source) {
+                length = readFeed(res->feed, segment->source, buffer + total, length);
+                if (length < 0 || (length == 0 && !segment->unknownSize)) {
+                    return -1;
+                }
+            } else if (segment->file) {
+                if (fread(buffer + total, 1, (size_t)length, segment->file) != (size_t)length) {
+                    return -1;
+                }
+            } else {
+                memcpy(buffer + total, segment->data + (size_t)upload->offset, (size_t)length);
+            }
+            if (!segment->unknownSize) {
+                upload->offset += (uint64_t)length;
+            }
+            total += length;
+            if (segment->unknownSize && length > 0) {
+                break;
+            }
+        }
+        if (segment->unknownSize ? length == 0 : upload->offset == segment->size) {
+            upload->index++;
+            upload->offset = 0;
+        }
+    }
+    if (upload->index == upload->count) {
+        finishFeed(res->feed);
+    }
+    return total;
+}
+
+#endif
+// End of inlined naett_upload.c //
+
+// Inlined naett_download_file.c: //
+//#include "naett_internal.h"
+
+#if __WINDOWS__ || defined(__APPLE__)
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#if __WINDOWS__
+#include <wchar.h>
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+struct DownloadFile {
+#if __WINDOWS__
+    HANDLE handle;
+    wchar_t* destination;
+    wchar_t* temporary;
+#else
+    FILE* stream;
+    char* destination;
+    char* temporary;
+#endif
+    int ownsTemporary;
+};
+
+static int closeDownloadFile(DownloadFile* file) {
+#if __WINDOWS__
+    HANDLE handle = file->handle;
+    file->handle = NULL;
+    return handle == NULL || CloseHandle(handle);
+#else
+    FILE* stream = file->stream;
+    file->stream = NULL;
+    return stream == NULL || fclose(stream) == 0;
+#endif
+}
+
+static void freeDownloadFile(DownloadFile* file) {
+    if (file) {
+        closeDownloadFile(file);
+        if (file->ownsTemporary) {
+#if __WINDOWS__
+            DeleteFileW(file->temporary);
+#else
+            unlink(file->temporary);
+#endif
+        }
+        free(file->temporary);
+        free(file->destination);
+        free(file);
+    }
+}
+
+#if __WINDOWS__
+static int openDownloadFile(DownloadFile* file, const char* path) {
+    wchar_t* widePath = winPathFromUTF8(path);
+    if (!widePath) {
+        return 0;
+    }
+    DWORD capacity = GetFullPathNameW(widePath, 0, NULL, NULL);
+    file->destination = capacity ? malloc((size_t)capacity * sizeof(wchar_t)) : NULL;
+    wchar_t* name = NULL;
+    DWORD length = file->destination ? GetFullPathNameW(widePath, capacity, file->destination, &name) : 0;
+    free(widePath);
+    if (!length || length >= capacity || !name || !*name) {
+        return 0;
+    }
+    DWORD attributes = GetFileAttributesW(file->destination);
+    if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        return 0;
+    }
+
+    size_t prefix = (size_t)(name - file->destination);
+    enum { suffixCapacity = 32 };
+    file->temporary = malloc((prefix + suffixCapacity) * sizeof(wchar_t));
+    if (!file->temporary) {
+        return 0;
+    }
+    memcpy(file->temporary, file->destination, prefix * sizeof(wchar_t));
+    for (int attempt = 0; attempt < 16; attempt++) {
+        unsigned int first, second;
+        if (rand_s(&first) || rand_s(&second)) {
+            return 0;
+        }
+        swprintf(file->temporary + prefix, suffixCapacity, L".naett-%08x%08x.tmp", first, second);
+        HANDLE handle = CreateFileW(file->temporary, GENERIC_WRITE, 0, NULL, CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+        if (handle != INVALID_HANDLE_VALUE) {
+            file->ownsTemporary = 1;
+            file->handle = handle;
+            return 1;
+        }
+        if (GetLastError() != ERROR_FILE_EXISTS) {
+            return 0;
+        }
+    }
+    return 0;
+}
+#else
+static int openDownloadFile(DownloadFile* file, const char* path) {
+    const char* separator = strrchr(path, '/');
+    const char* name = separator ? separator + 1 : path;
+    if (!*name || strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+        return 0;
+    }
+    char* directory = separator ? strndup(path, separator == path ? 1 : (size_t)(separator - path)) : strdup(".");
+    if (!directory) {
+        return 0;
+    }
+    char* parent = realpath(directory, NULL);
+    free(directory);
+    if (!parent) {
+        return 0;
+    }
+
+    const char* join = strcmp(parent, "/") == 0 ? "" : "/";
+    size_t prefix = strlen(parent) + strlen(join);
+    const char pattern[] = ".naett-XXXXXX";
+    size_t destinationSize = prefix + strlen(name) + 1;
+    file->destination = malloc(destinationSize);
+    file->temporary = malloc(prefix + sizeof(pattern));
+    int fd = -1;
+    if (file->destination && file->temporary) {
+        snprintf(file->destination, destinationSize, "%s%s%s", parent, join, name);
+        struct stat info;
+        if (stat(file->destination, &info) != 0 || !S_ISDIR(info.st_mode)) {
+            snprintf(file->temporary, prefix + sizeof(pattern), "%s%s%s", parent, join, pattern);
+            fd = mkstemp(file->temporary);
+        }
+    }
+    free(parent);
+    if (fd < 0) {
+        return 0;
+    }
+    file->ownsTemporary = 1;
+    file->stream = fdopen(fd, "wb");
+    if (!file->stream) {
+        close(fd);
+        return 0;
+    }
+    return 1;
+}
+#endif
+
+static DownloadFile* createDownloadFile(const char* path) {
+    DownloadFile* file = calloc(1, sizeof(*file));
+    if (file && (!path || !*path || !openDownloadFile(file, path))) {
+        freeDownloadFile(file);
+        return NULL;
+    }
+    return file;
+}
+
+static int writeDownloadFile(DownloadFile* file, const void* data, int bytes) {
+#if __WINDOWS__
+    DWORD written;
+    return WriteFile(file->handle, data, (DWORD)bytes, &written, NULL) ? (int)written : -1;
+#else
+    return (int)fwrite(data, 1, (size_t)bytes, file->stream);
+#endif
+}
+
+static int commitDownloadFile(DownloadFile* file) {
+    if (!file->ownsTemporary) {
+        return 1;
+    }
+#if __WINDOWS__
+    if (!file->handle || !closeDownloadFile(file)) {
+        return 0;
+    }
+    int moved = MoveFileExW(file->temporary, file->destination, MOVEFILE_REPLACE_EXISTING);
+#else
+    if (!file->stream || !closeDownloadFile(file)) {
+        return 0;
+    }
+    int moved = rename(file->temporary, file->destination) == 0;
+#endif
+    if (moved) {
+        file->ownsTemporary = 0;
+    }
+    return moved;
+}
+
+#endif
+// End of inlined naett_download_file.c //
+
+// Inlined naett_core.c: //
+//#include "naett_internal.h"
 #include <stdarg.h>
 #include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
 #include <assert.h>
+#include <errno.h>
+#include <limits.h>
 
 typedef struct InternalParam* InternalParamPtr;
 typedef void (*ParamSetter)(InternalParamPtr param, InternalRequest* req);
@@ -194,6 +1114,9 @@ static int defaultBodyReader(void* dest, int bufferSize, void* userData) {
     int bytesToRead = buffer->size - buffer->position;
     if (bytesToRead > bufferSize) {
         bytesToRead = bufferSize;
+    }
+    if (bytesToRead == 0) {
+        return 0;
     }
 
     const char* source = ((const char*)buffer->data) + buffer->position;
@@ -387,7 +1310,7 @@ naettReq* naettRequest_va(const char* url, int numArgs, ...) {
     return NULL;
 }
 
-naettReq* naettRequestWithOptions(const char* url, int numOptions, const naettOption** options) {
+static InternalRequest* requestWithOptions(const char* url, int numOptions, const naettOption** options) {
     assert(url != NULL);
     assert(numOptions == 0 || options != NULL);
 
@@ -399,7 +1322,11 @@ naettReq* naettRequestWithOptions(const char* url, int numOptions, const naettOp
         applyOptionParams(req, option);
         free(option);
     }
+    return req;
+}
 
+naettReq* naettRequestWithOptions(const char* url, int numOptions, const naettOption** options) {
+    InternalRequest* req = requestWithOptions(url, numOptions, options);
     setupDefaultRW(req);
 
     if (naettPlatformInitRequest(req)) {
@@ -410,13 +1337,80 @@ naettReq* naettRequestWithOptions(const char* url, int numOptions, const naettOp
     return NULL;
 }
 
-naettRes* naettMake(naettReq* request) {
+static naettReq* requestWithUpload(const char* url, int numOptions, const naettOption** options,
+    const char* bodyFile, int numParts, const naettMultipartPart* parts, const int64_t* sourceLengths, int* error) {
+    InternalRequest* req = requestWithOptions(url, numOptions, options);
+    int status = naettProtocolError;
+#if __WINDOWS__ || defined(__APPLE__)
+    char contentType[80];
+    status = prepareUpload(req, bodyFile, numParts, parts, sourceLengths, contentType, sizeof(contentType));
+    if (!status) {
+        if (parts) {
+            InternalOption* header = (InternalOption*)naettHeader("Content-Type", contentType);
+            applyOptionParams(req, header);
+            free(header);
+        }
+        setupDefaultRW(req);
+        if (naettPlatformInitRequest(req)) {
+            if (error) {
+                *error = 0;
+            }
+            return (naettReq*)req;
+        }
+        status = naettGenericError;
+    }
+#endif
+    naettFree((naettReq*)req);
+    if (error) {
+        *error = status;
+    }
+    return NULL;
+}
+
+naettReq* naettRequestWithUpload(const char* url, int numOptions, const naettOption** options,
+    const char* bodyFile, int numParts, const naettMultipartPart* parts, int* error) {
+    return requestWithUpload(url, numOptions, options, bodyFile, numParts, parts, NULL, error);
+}
+
+naettReq* naettRequestWithSources(const char* url, int numOptions, const naettOption** options,
+    int numParts, const naettMultipartPart* parts, const int64_t* sourceLengths, int* error) {
+    return requestWithUpload(url, numOptions, options, NULL, numParts, parts, sourceLengths, error);
+}
+
+static naettRes* makeResponse(naettReq* request, DownloadSink* sink, DownloadFile* file, int cancellable) {
     assert(initialized);
     assert(request != NULL);
 
     InternalRequest* req = (InternalRequest*)request;
     naettAlloc(InternalResponse, res);
+    if (!res) {
+        return NULL;
+    }
     res->request = req;
+    res->sink = sink;
+    res->downloadFile = file;
+    res->cancellable = cancellable;
+#if __WINDOWS__ || defined(__APPLE__)
+    if (req->upload && req->upload->hasSource) {
+        res->feed = createFeed();
+        if (!res->feed) {
+            free(res);
+            return NULL;
+        }
+        res->cancellable = 1;
+    }
+#endif
+#if __WINDOWS__
+    res->downloadLength = -1;
+#elif defined(__APPLE__)
+    atomic_init(&res->complete, 0);
+    atomic_init(&res->contentLength, 0);
+    atomic_init(&res->downloadLength, -1);
+    atomic_init(&res->totalBytesRead, 0);
+    atomic_init(&res->uploadStop, 0);
+    atomic_init(&res->cancelRequested, 0);
+    atomic_init(&res->uploaded, 0);
+#endif
 
     if (req->options.bodyWriter == defaultBodyWriter) {
         req->options.bodyWriterData = (void*) &res->body;
@@ -424,6 +1418,137 @@ naettRes* naettMake(naettReq* request) {
 
     naettPlatformMakeRequest(res);
     return (naettRes*) res;
+}
+
+naettRes* naettMake(naettReq* request) {
+    return makeResponse(request, NULL, NULL, 0);
+}
+
+naettRes* naettMakeCancellable(naettReq* request) {
+    return makeResponse(request, NULL, NULL, 1);
+}
+
+naettRes* naettMakeWithSink(naettReq* request) {
+#if __WINDOWS__ || defined(__APPLE__)
+    DownloadSink* sink = createSink();
+    if (sink) {
+        naettRes* response = makeResponse(request, sink, NULL, 1);
+        if (response) {
+            return response;
+        }
+        freeSink(sink);
+    }
+#endif
+    return NULL;
+}
+
+naettRes* naettMakeWithResponseFile(naettReq* request, const char* path, int* error) {
+    int status = naettGenericError;
+#if __WINDOWS__ || defined(__APPLE__)
+    DownloadFile* file = createDownloadFile(path);
+    if (file) {
+        naettRes* response = makeResponse(request, NULL, file, 1);
+        if (response) {
+            if (error) {
+                *error = 0;
+            }
+            return response;
+        }
+        freeDownloadFile(file);
+    } else {
+        status = naettWriteError;
+    }
+#endif
+    if (error) {
+        *error = status;
+    }
+    return NULL;
+}
+
+int naettCommitResponseFile(naettRes* response) {
+#if __WINDOWS__ || defined(__APPLE__)
+    InternalResponse* res = (InternalResponse*)response;
+    if (res && res->downloadFile && naettComplete(response) && res->code >= 200 && res->code < 300) {
+        return commitDownloadFile(res->downloadFile) ? 0 : naettWriteError;
+    }
+#endif
+    return naettProtocolError;
+}
+
+int naettReadSink(naettRes* response, void* buffer, int capacity, int timeoutMS) {
+#if __WINDOWS__ || defined(__APPLE__)
+    assert(response != NULL && buffer != NULL && capacity > 0);
+    InternalResponse* res = (InternalResponse*)response;
+    assert(res->sink != NULL);
+    return readSink(res->sink, buffer, capacity, timeoutMS);
+#else
+    return 0;
+#endif
+}
+
+#if __WINDOWS__ || defined(__APPLE__)
+static void cancelResponseStreams(naettRes* response) {
+    assert(response != NULL);
+    InternalResponse* res = (InternalResponse*)response;
+    if (res->sink) {
+        stopSink(res->sink);
+    }
+    changeFeed(res->feed, FeedCancel);
+    if (!naettComplete(response)) {
+        naettPlatformCancel(res);
+    }
+}
+#endif
+
+void naettCancel(naettRes* response) {
+#if __WINDOWS__ || defined(__APPLE__)
+    InternalResponse* res = (InternalResponse*)response;
+    if (res && res->cancellable) {
+        cancelResponseStreams(response);
+    }
+#endif
+}
+
+void naettStopSink(naettRes* response) {
+    naettCancel(response);
+}
+
+uint64_t naettActivityVersion(void) {
+#if __WINDOWS__ || defined(__APPLE__)
+    return getActivityVersion();
+#else
+    return 0;
+#endif
+}
+
+void naettWaitForActivity(uint64_t version, int timeoutMS) {
+#if __WINDOWS__ || defined(__APPLE__)
+    waitForActivity(version, timeoutMS);
+#endif
+}
+
+int naettGetUploadSourceRequest(naettRes* response, int* capacity, uint64_t* attempt, int timeoutMS) {
+#if __WINDOWS__ || defined(__APPLE__)
+    InternalResponse* res = (InternalResponse*)response;
+    if (res && res->feed && capacity && attempt) {
+        return requestFeed(res->feed, capacity, attempt, timeoutMS);
+    }
+#endif
+    return -1;
+}
+
+int naettSupplyUploadSource(naettRes* response, uint64_t attempt, const void* data, int size) {
+#if __WINDOWS__ || defined(__APPLE__)
+    InternalResponse* res = (InternalResponse*)response;
+    if (res && res->feed) {
+        return supplyFeed(res->feed, attempt, data, size);
+    }
+#endif
+    return 0;
+}
+
+void naettStopUploadSource(naettRes* response) {
+    naettCancel(response);
 }
 
 const void* naettGetBody(naettRes* response, int* size) {
@@ -435,14 +1560,136 @@ const void* naettGetBody(naettRes* response, int* size) {
     return res->body.data;
 }
 
+static int64_t responseLength(InternalResponse* res) {
+#if __WINDOWS__
+    return InterlockedCompareExchange64(&res->contentLength, 0, 0);
+#elif defined(__APPLE__)
+    return atomic_load_explicit(&res->contentLength, memory_order_relaxed);
+#else
+    return res->contentLength;
+#endif
+}
+
+static uint64_t responseBytesRead(InternalResponse* res) {
+#if __WINDOWS__
+    return (uint64_t)InterlockedCompareExchange64(&res->totalBytesRead, 0, 0);
+#elif defined(__APPLE__)
+    return atomic_load_explicit(&res->totalBytesRead, memory_order_acquire);
+#else
+    return res->totalBytesRead;
+#endif
+}
+
 int naettGetTotalBytesRead(naettRes* response, int* totalSize) {
     assert(response != NULL);
     assert(totalSize != NULL);
-
     InternalResponse* res = (InternalResponse*)response;
-    *totalSize = res->contentLength;
-    return res->totalBytesRead;
+    int64_t length = responseLength(res);
+    uint64_t read = responseBytesRead(res);
+    *totalSize = length > INT_MAX ? -1 : (int)length;
+    return read > INT_MAX ? INT_MAX : (int)read;
 }
+
+#if __WINDOWS__ || defined(__APPLE__)
+static int64_t downloadLength(InternalResponse* res) {
+#if __WINDOWS__
+    return InterlockedCompareExchange64(&res->downloadLength, 0, 0);
+#else
+    return atomic_load_explicit(&res->downloadLength, memory_order_acquire);
+#endif
+}
+
+static int64_t expectedDownloadLength(InternalResponse* res, int64_t headerLength) {
+    int status = res->code;
+    const char* method = res->request->options.method;
+    if (status == naettProcessing) {
+        return -1;
+    }
+    if (status < 200 || status == 204 || status == 205 || status == 304 || strcmp(method, "HEAD") == 0 ||
+        (status < 300 && strcmp(method, "CONNECT") == 0)) {
+        return 0;
+    }
+    naettRes* response = (naettRes*)res;
+    if (naettGetHeader(response, "Transfer-Encoding")) {
+        return -1;
+    }
+#if __APPLE__
+    const char* encoding = naettGetHeader(response, "Content-Encoding");
+    if (encoding && strcasecmp(encoding, "identity") != 0) {
+        return -1;
+    }
+#endif
+    return headerLength;
+}
+
+static void finishResponse(InternalResponse* res) {
+    int notify = res->cancellable;
+    changeFeed(res->feed, FeedInterrupt);
+    if (res->sink || res->downloadFile) {
+        int64_t expected = downloadLength(res);
+        if (res->code >= 200 && expected >= 0 && responseBytesRead(res) != (uint64_t)expected) {
+            res->code = naettReadError;
+        }
+        if (res->sink) {
+            finishSink(res->sink);
+        }
+    }
+#if __WINDOWS__
+    InterlockedExchange(&res->complete, 1);
+#else
+    atomic_store_explicit(&res->complete, 1, memory_order_release);
+#endif
+    if (notify) {
+        signalActivity();
+    }
+}
+
+static int writeResponseBody(InternalResponse* res, const void* bytes, int length) {
+    if (res->sink) {
+        return writeSink(res->sink, bytes, length);
+    }
+    if (res->downloadFile) {
+        return res->code >= 200 && res->code < 300 ? writeDownloadFile(res->downloadFile, bytes, length) : length;
+    }
+    RequestOptions* options = &res->request->options;
+    return options->bodyWriter(bytes, length, options->bodyWriterData);
+}
+
+static void readResponseLength(InternalResponse* res) {
+    const char* header = naettGetHeader((naettRes*)res, "Content-Length");
+    int64_t length = -1;
+    if (header) {
+        char* end;
+        errno = 0;
+        long long value = strtoll(header, &end, 10);
+        if (end != header && errno != ERANGE && value >= 0 && end[strspn(end, " \t")] == '\0') {
+            length = value;
+        }
+    }
+    int64_t expected = expectedDownloadLength(res, length);
+#if __WINDOWS__
+    InterlockedExchange64(&res->contentLength, length);
+    InterlockedExchange64(&res->downloadLength, expected);
+#else
+    atomic_store_explicit(&res->contentLength, length, memory_order_relaxed);
+    atomic_store_explicit(&res->downloadLength, expected, memory_order_release);
+#endif
+    if (res->cancellable) {
+        signalActivity();
+    }
+}
+
+static void recordResponseBytes(InternalResponse* res, int bytes) {
+#if __WINDOWS__
+    InterlockedExchangeAdd64(&res->totalBytesRead, bytes);
+#else
+    atomic_fetch_add_explicit(&res->totalBytesRead, (uint64_t)bytes, memory_order_release);
+#endif
+    if (res->cancellable) {
+        signalActivity();
+    }
+}
+#endif
 
 const char* naettGetHeader(naettRes* response, const char* name) {
     assert(response != NULL);
@@ -482,13 +1729,50 @@ naettReq* naettGetRequest(naettRes* response) {
 int naettComplete(const naettRes* response) {
     assert(response != NULL);
     InternalResponse* res = (InternalResponse*)response;
+#if __WINDOWS__
+    return InterlockedCompareExchange(&res->complete, 0, 0);
+#elif defined(__APPLE__)
+    return atomic_load_explicit(&res->complete, memory_order_acquire);
+#else
     return res->complete;
+#endif
 }
 
 int naettGetStatus(const naettRes* response) {
     assert(response != NULL);
     InternalResponse* res = (InternalResponse*)response;
     return res->code;
+}
+
+uint64_t naettGetUploadProgress(const naettRes* response, uint64_t* totalSize) {
+    assert(response != NULL);
+    assert(totalSize != NULL);
+    *totalSize = 0;
+#if __WINDOWS__ || defined(__APPLE__)
+    InternalResponse* res = (InternalResponse*)response;
+    if (res->request->upload) {
+        UploadBody* upload = res->request->upload;
+        *totalSize = upload->unknownSize ? UINT64_MAX : upload->size;
+#if __WINDOWS__
+        return (uint64_t)InterlockedCompareExchange64(&res->uploaded, 0, 0);
+#else
+        return atomic_load_explicit(&res->uploaded, memory_order_relaxed);
+#endif
+    }
+#endif
+    return 0;
+}
+
+uint64_t naettGetDownloadProgress(const naettRes* response, int64_t* totalSize) {
+    assert(response != NULL && totalSize != NULL);
+    InternalResponse* res = (InternalResponse*)response;
+    uint64_t received = responseBytesRead(res);
+#if __WINDOWS__ || defined(__APPLE__)
+    *totalSize = downloadLength(res);
+#else
+    *totalSize = -1;
+#endif
+    return received;
 }
 
 static void freeKVList(KVLink* node) {
@@ -506,9 +1790,13 @@ void naettFree(naettReq* request) {
 
     InternalRequest* req = (InternalRequest*)request;
     naettPlatformFreeRequest(req);
+#if __WINDOWS__ || defined(__APPLE__)
+    freeUpload(req->upload);
+#endif
     KVLink* node = req->options.headers;
     freeKVList(node);
     free((void*)req->options.method);
+    free((void*)req->options.userAgent);
     free((void*)req->url);
     free(request);
 }
@@ -517,11 +1805,16 @@ void naettClose(naettRes* response) {
     assert(response != NULL);
 
     InternalResponse* res = (InternalResponse*)response;
-    res->request = NULL;
     naettPlatformCloseResponse(res);
+    res->request = NULL;
     KVLink* node = res->headers;
     freeKVList(node);
     free(res->body.data);
+#if __WINDOWS__ || defined(__APPLE__)
+    freeSink(res->sink);
+    freeDownloadFile(res->downloadFile);
+    freeFeed(res->feed);
+#endif
     free(response);
 }
 // End of inlined naett_core.c //
@@ -599,6 +1892,7 @@ void naettClose(naettRes* response) {
 #endif // NAETT_OBJC_H
 // End of inlined naett_objc.h //
 
+#include <CoreFoundation/CFRunLoop.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -641,7 +1935,11 @@ int naettPlatformInitRequest(InternalRequest* req) {
     id p = pool();
 
     id urlString = NSString(req->url);
-    id url = objc_msgSend_t(id, id)(class("NSURL"), sel("URLWithString:"), urlString);
+    id url = urlString == nil ? nil : objc_msgSend_t(id, id)(class("NSURL"), sel("URLWithString:"), urlString);
+    if (url == nil) {
+        release(p);
+        return 0;
+    }
 
     id request = objc_msgSend_t(id, id)(class("NSMutableURLRequest"), sel("requestWithURL:"), url);
 
@@ -666,7 +1964,21 @@ int naettPlatformInitRequest(InternalRequest* req) {
     char byteBuffer[10240];
     int bytesRead = 0;
 
-    if (req->options.bodyReader != NULL) {
+    if (req->upload) {
+        if (req->upload->filePath) {
+            id path = NSString(req->upload->filePath);
+            if (path == nil) {
+                release(p);
+                return 0;
+            }
+            req->uploadFileURL = objc_msgSend_t(id, id)(class("NSURL"), sel("fileURLWithPath:"), path);
+            if (req->uploadFileURL == nil) {
+                release(p);
+                return 0;
+            }
+            retain(req->uploadFileURL);
+        }
+    } else if (req->options.bodyReader != NULL) {
         id bodyData =
             objc_msgSend_t(id, NSUInteger)(class("NSMutableData"), sel("dataWithCapacity:"), sizeof(byteBuffer));
 
@@ -689,18 +2001,12 @@ int naettPlatformInitRequest(InternalRequest* req) {
     return 1;
 }
 
-void didReceiveData(id self, SEL _sel, id session, id dataTask, id data) {
-    InternalResponse* res = NULL;
-    id p = pool();
+static void readResponseHeaders(InternalResponse* res, id response) {
+    res->code = objc_msgSend_t(NSInteger)(response, sel("statusCode"));
+    id allHeaders = objc_msgSend_t(id)(response, sel("allHeaderFields"));
 
-    object_getInstanceVariable(self, "response", (void**)&res);
-
-    if (res->headers == NULL) {
-        id response = objc_msgSend_t(id)(dataTask, sel("response"));
-        res->code = objc_msgSend_t(NSInteger)(response, sel("statusCode"));
-        id allHeaders = objc_msgSend_t(id)(response, sel("allHeaderFields"));
-
-        NSUInteger headerCount = objc_msgSend_t(NSUInteger)(allHeaders, sel("count"));
+    NSUInteger headerCount = objc_msgSend_t(NSUInteger)(allHeaders, sel("count"));
+    if (headerCount > 0) {
         id headerNames[headerCount];
         id headerValues[headerCount];
 
@@ -715,30 +2021,195 @@ void didReceiveData(id self, SEL _sel, id session, id dataTask, id data) {
             firstHeader = node;
         }
         res->headers = firstHeader;
-
-        const char* contentLength = naettGetHeader((naettRes*)res, "Content-Length");
-        if (!contentLength || sscanf(contentLength, "%d", &res->contentLength) != 1) {
-            res->contentLength = -1;
-        }
     }
 
-    const void* bytes = objc_msgSend_t(const void*)(data, sel("bytes"));
+    readResponseLength(res);
+}
+
+static void didReceiveResponse(id self, SEL _sel, id session, id dataTask, id response, void (^reply)(NSInteger)) {
+    InternalResponse* res = NULL;
+    object_getInstanceVariable(self, "response", (void**)&res);
+    if (res && res->code == naettProcessing) {
+        id p = pool();
+        readResponseHeaders(res, response);
+        release(p);
+    }
+    reply(1); // NSURLSessionResponseAllow
+}
+
+void didReceiveData(id self, SEL _sel, id session, id dataTask, id data) {
+    InternalResponse* res = NULL;
+    id p = pool();
+
+    object_getInstanceVariable(self, "response", (void**)&res);
+
+    if (res->code == naettProcessing) {
+        readResponseHeaders(res, objc_msgSend_id(dataTask, sel("response")));
+    }
+
+    const unsigned char* bytes = objc_msgSend_t(const unsigned char*)(data, sel("bytes"));
     NSUInteger length = objc_msgSend_t(NSUInteger)(data, sel("length"));
 
-    res->request->options.bodyWriter(bytes, length, res->request->options.bodyWriterData);
-    res->totalBytesRead += (int)length;
+    while (length > 0) {
+        int count = length > INT_MAX ? INT_MAX : (int)length;
+        if (writeResponseBody(res, bytes, count) != count && (res->sink || res->downloadFile)) {
+            res->code = naettWriteError;
+            objc_msgSend_void(dataTask, sel("cancel"));
+            break;
+        }
+        recordResponseBytes(res, count);
+        bytes += count;
+        length -= (NSUInteger)count;
+    }
 
     release(p);
+}
+
+typedef struct {
+    InternalResponse* response;
+    char buffer[16384];
+    int size;
+    int offset;
+    int done;
+} UploadPump;
+
+static void pumpUploadStream(CFWriteStreamRef stream, CFStreamEventType event, void* context) {
+    UploadPump* pump = context;
+    InternalResponse* res = pump->response;
+    if (event != kCFStreamEventCanAcceptBytes) {
+        pump->done = 1;
+        return;
+    }
+    while (!pump->done && !atomic_load_explicit(&res->uploadStop, memory_order_relaxed) &&
+        CFWriteStreamCanAcceptBytes(stream)) {
+        if (pump->offset == pump->size) {
+            pump->size = readUpload(res, pump->buffer, sizeof(pump->buffer));
+            if (pump->size <= 0) {
+                res->uploadReadError = pump->size < 0 &&
+                    !atomic_load_explicit(&res->uploadStop, memory_order_relaxed);
+                pump->done = 1;
+                break;
+            }
+            pump->offset = 0;
+        }
+        CFIndex written = CFWriteStreamWrite(stream, (const UInt8*)pump->buffer + pump->offset,
+            pump->size - pump->offset);
+        if (written <= 0) {
+            pump->done = 1;
+            break;
+        }
+        pump->offset += (int)written;
+    }
+}
+
+static void* writeUploadStream(void* context) {
+    InternalResponse* res = context;
+    CFWriteStreamRef stream = res->uploadStream;
+    UploadPump pump = { .response = res };
+    CFStreamClientContext client = { .info = &pump };
+    CFOptionFlags events = kCFStreamEventCanAcceptBytes | kCFStreamEventErrorOccurred | kCFStreamEventEndEncountered;
+    if (CFWriteStreamSetClient(stream, events, pumpUploadStream, &client)) {
+        CFRunLoopRef runLoop = CFRunLoopGetCurrent();
+        CFWriteStreamScheduleWithRunLoop(stream, runLoop, kCFRunLoopDefaultMode);
+        if (CFWriteStreamOpen(stream)) {
+            while (!pump.done && !atomic_load_explicit(&res->uploadStop, memory_order_relaxed)) {
+                if (CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.02, true) == kCFRunLoopRunFinished) {
+                    break;
+                }
+            }
+        }
+        CFWriteStreamUnscheduleFromRunLoop(stream, runLoop, kCFRunLoopDefaultMode);
+        CFWriteStreamSetClient(stream, 0, NULL, NULL);
+    }
+    CFWriteStreamClose(stream);
+    return NULL;
+}
+
+static void stopUploadStream(InternalResponse* res) {
+    if (res->uploadWorkerActive) {
+        atomic_store_explicit(&res->uploadStop, 1, memory_order_relaxed);
+        changeFeed(res->feed, FeedInterrupt);
+        pthread_join(res->uploadWorker, NULL);
+        res->uploadWorkerActive = 0;
+        CFRelease(res->uploadStream);
+        res->uploadStream = NULL;
+    }
+}
+
+static void needNewBodyStream(id self, SEL _sel, id session, id task, void (^reply)(id)) {
+    InternalResponse* res = NULL;
+    object_getInstanceVariable(self, "response", (void**)&res);
+    if (!res || !res->request->upload) {
+        reply(nil);
+        return;
+    }
+
+    stopUploadStream(res);
+    if (res->uploadReadError || !resetUpload(res)) {
+        res->uploadReadError = 1;
+        reply(nil);
+        return;
+    }
+    atomic_store_explicit(&res->uploaded, 0, memory_order_relaxed);
+
+    CFReadStreamRef input = NULL;
+    CFWriteStreamRef output = NULL;
+    CFStreamCreateBoundPair(NULL, &input, &output, 16384);
+    if (input && output) {
+        res->uploadStream = output;
+        atomic_store_explicit(&res->uploadStop, 0, memory_order_relaxed);
+        if (pthread_create(&res->uploadWorker, NULL, writeUploadStream, res) == 0) {
+            res->uploadWorkerActive = 1;
+            reply((id)input);
+            CFRelease(input);
+            return;
+        }
+        res->uploadStream = NULL;
+    }
+    if (input) {
+        CFRelease(input);
+    }
+    if (output) {
+        CFRelease(output);
+    }
+    res->code = naettGenericError;
+    reply(nil);
+}
+
+static void didSendBodyData(id self, SEL _sel, id session, id task, int64_t bytesSent,
+    int64_t totalBytesSent, int64_t totalBytesExpected) {
+    InternalResponse* res = NULL;
+    object_getInstanceVariable(self, "response", (void**)&res);
+    if (res && res->request->upload && totalBytesSent >= 0) {
+        uint64_t sent = (uint64_t)totalBytesSent;
+        UploadBody* upload = res->request->upload;
+        atomic_store_explicit(&res->uploaded, upload->unknownSize || sent < upload->size ? sent : upload->size,
+            memory_order_relaxed);
+        if (res->cancellable) {
+            signalActivity();
+        }
+    }
 }
 
 static void didComplete(id self, SEL _sel, id session, id dataTask, id error) {
     InternalResponse* res = NULL;
     object_getInstanceVariable(self, "response", (void**)&res);
     if (res != NULL) {
-        if (error != nil) {
+        stopUploadStream(res);
+        if (res->sink && sinkStopped(res->sink)) {
+            res->code = naettWriteError;
+        } else if (atomic_load_explicit(&res->cancelRequested, memory_order_acquire)) {
+            res->code = naettCancelled;
+        } else if (res->uploadReadError) {
+            res->code = naettReadError;
+        } else if (error != nil && res->code >= 0) {
             res->code = naettConnectionError;
+        } else if (res->code == naettProcessing) {
+            id p = pool();
+            readResponseHeaders(res, objc_msgSend_id(dataTask, sel("response")));
+            release(p);
         }
-        res->complete = 1;
+        finishResponse(res);
     }
 }
 
@@ -749,8 +2220,13 @@ static id createDelegate(void) {
         TaskDelegateClass = objc_allocateClassPair((Class)objc_getClass("NSObject"), "naettTaskDelegate", 0);
         class_addProtocol(TaskDelegateClass, (Protocol* _Nonnull)objc_getProtocol("NSURLSessionDataDelegate"));
 
+        addMethod(TaskDelegateClass, "URLSession:dataTask:didReceiveResponse:completionHandler:",
+            didReceiveResponse, "v@:@@@@?");
         addMethod(TaskDelegateClass, "URLSession:dataTask:didReceiveData:", didReceiveData, "v@:@@@");
         addMethod(TaskDelegateClass, "URLSession:task:didCompleteWithError:", didComplete, "v@:@@@");
+        addMethod(TaskDelegateClass, "URLSession:task:needNewBodyStream:", needNewBodyStream, "v@:@@@?");
+        addMethod(TaskDelegateClass, "URLSession:task:didSendBodyData:totalBytesSent:totalBytesExpectedToSend:",
+            didSendBodyData, "v@:@@qqq");
         addIvar(TaskDelegateClass, "response", sizeof(void*), "^v");
     }
 
@@ -775,9 +2251,27 @@ void naettPlatformMakeRequest(InternalResponse* res) {
         delegate,
         nil);
 
+    retain(session);
     res->session = session;
 
-    id task = objc_msgSend_t(id, id)(session, sel("dataTaskWithRequest:"), req->urlRequest);
+    id task;
+    if (req->uploadFileURL) {
+        task = objc_msgSend_t(id, id, id)(session, sel("uploadTaskWithRequest:fromFile:"),
+            req->urlRequest, req->uploadFileURL);
+    } else {
+        SEL taskMethod = req->upload ? sel("uploadTaskWithStreamedRequest:") : sel("dataTaskWithRequest:");
+        task = objc_msgSend_t(id, id)(session, taskMethod, req->urlRequest);
+    }
+    if (task == nil) {
+        res->code = naettGenericError;
+        release(p);
+        finishResponse(res);
+        return;
+    }
+    if (res->cancellable) {
+        retain(task);
+        res->task = task;
+    }
     objc_msgSend_void(task, sel("resume"));
 
     release(p);
@@ -786,11 +2280,20 @@ void naettPlatformMakeRequest(InternalResponse* res) {
 void naettPlatformFreeRequest(InternalRequest* req) {
     release(req->urlRequest);
     req->urlRequest = nil;
+    release(req->uploadFileURL);
+    req->uploadFileURL = nil;
 }
 
 void naettPlatformCloseResponse(InternalResponse* res) {
     objc_msgSend_void(res->session, sel("invalidateAndCancel"));
+    release(res->task);
+    release(res->session);
     res->session = nil;
+}
+
+void naettPlatformCancel(InternalResponse* res) {
+    atomic_store_explicit(&res->cancelRequested, 1, memory_order_release);
+    objc_msgSend_void(res->task, sel("cancel"));
 }
 
 #endif  // __APPLE__
@@ -1042,6 +2545,7 @@ void naettPlatformCloseResponse(InternalResponse* res) {
 #include <winhttp.h>
 #include <assert.h>
 #include <tchar.h>
+#include <process.h>
 
 void naettPlatformInit(naettInitData initData) {
 }
@@ -1122,9 +2626,88 @@ static void unpackHeaders(InternalResponse* res, LPWSTR packed) {
     res->headers = firstHeader;
 }
 
+static void winFinishResponse(InternalResponse* res) {
+    if (!res->cancellable) {
+        finishResponse(res);
+    } else if (InterlockedExchange(&res->streamClosing, 1) == 0) {
+        HINTERNET request = res->request->request;
+        res->request->request = NULL;
+        changeFeed(res->feed, FeedInterrupt);
+        // Wait for HANDLE_CLOSING before publishing completion.
+        WinHttpCloseHandle(request);
+    }
+}
+
+static void winSendRequest(InternalResponse* res, HINTERNET request);
+
+static int retryUpload(InternalResponse* res, HINTERNET request, DWORD error) {
+    if (error != ERROR_WINHTTP_RESEND_REQUEST || !res->request->upload || res->uploadRetries == 3) {
+        return 0;
+    }
+    res->uploadRetries++;
+    winSendRequest(res, request);
+    return 1;
+}
+
+static int fillWinUpload(InternalResponse* res) {
+    res->uploadOffset = 0;
+    res->uploadStart = 0;
+    res->uploadPayloadStart = 0;
+    res->uploadPayloadEnd = 0;
+    if (res->uploadEnded) {
+        res->uploadSize = 0;
+        return 1;
+    }
+
+    InternalRequest* req = res->request;
+    int chunked = req->upload && req->upload->unknownSize;
+    enum { prefixSpace = 16 };
+    int prefix = chunked ? prefixSpace : 0;
+    int capacity = (int)sizeof(res->buffer) - prefix - (chunked ? 2 : 0);
+    int bytes = req->upload ? readUpload(res, res->buffer + prefix, capacity)
+        : req->options.bodyReader(res->buffer, capacity, req->options.bodyReaderData);
+    if (bytes < 0 || bytes > capacity) {
+        return 0;
+    }
+    res->uploadPayloadEnd = (DWORD)bytes;
+    res->uploadSize = (DWORD)bytes;
+    if (chunked && bytes > 0) {
+        char header[prefixSpace];
+        DWORD size = (DWORD)snprintf(header, sizeof(header), "%x\r\n", (unsigned int)bytes);
+        res->uploadStart = prefixSpace - size;
+        memcpy(res->buffer + res->uploadStart, header, size);
+        memcpy(res->buffer + prefixSpace + bytes, "\r\n", 2);
+        res->uploadPayloadStart = size;
+        res->uploadPayloadEnd += size;
+        res->uploadSize += size + 2;
+    } else if (chunked) {
+        memcpy(res->buffer, "0\r\n\r\n", 5);
+        res->uploadSize = 5;
+        res->uploadEnded = 1;
+    }
+    return 1;
+}
+
 static void CALLBACK
 callback(HINTERNET request, DWORD_PTR context, DWORD status, LPVOID statusInformation, DWORD statusInfoLength) {
     InternalResponse* res = (InternalResponse*)context;
+    if (!res) {
+        return;
+    }
+    if (status == WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING) {
+        if (res->cancellable) {
+            if (res->sink && sinkStopped(res->sink)) {
+                res->code = naettWriteError;
+            } else if (InterlockedCompareExchange(&res->cancelRequested, 0, 0)) {
+                res->code = naettCancelled;
+            }
+            finishResponse(res);
+        }
+        return;
+    }
+    if (res->cancellable && InterlockedCompareExchange(&res->streamClosing, 0, 0)) {
+        return;
+    }
 
     switch (status) {
         case WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE: {
@@ -1135,20 +2718,17 @@ callback(HINTERNET request, DWORD_PTR context, DWORD status, LPVOID statusInform
                 NULL,
                 &bufSize,
                 WINHTTP_NO_HEADER_INDEX);
-            LPWSTR buffer = (LPWSTR)malloc(bufSize);
-            WinHttpQueryHeaders(request,
-                WINHTTP_QUERY_RAW_HEADERS,
-                WINHTTP_HEADER_NAME_BY_INDEX,
-                buffer,
-                &bufSize,
-                WINHTTP_NO_HEADER_INDEX);
+            LPWSTR buffer = bufSize ? malloc(bufSize) : NULL;
+            if (!buffer || !WinHttpQueryHeaders(request,
+                    WINHTTP_QUERY_RAW_HEADERS, WINHTTP_HEADER_NAME_BY_INDEX, buffer, &bufSize,
+                    WINHTTP_NO_HEADER_INDEX)) {
+                free(buffer);
+                res->code = naettProtocolError;
+                winFinishResponse(res);
+                break;
+            }
             unpackHeaders(res, buffer);
             free(buffer);
-
-            const char* contentLength = naettGetHeader((naettRes*)res, "Content-Length");
-            if (!contentLength || sscanf(contentLength, "%d", &res->contentLength) != 1) {
-                res->contentLength = -1;
-            }
 
             DWORD statusCode = 0;
             DWORD statusCodeSize = sizeof(statusCode);
@@ -1160,10 +2740,11 @@ callback(HINTERNET request, DWORD_PTR context, DWORD status, LPVOID statusInform
                 &statusCodeSize,
                 WINHTTP_NO_HEADER_INDEX);
             res->code = statusCode;
+            readResponseLength(res);
 
             if (!WinHttpQueryDataAvailable(request, NULL)) {
                 res->code = naettProtocolError;
-                res->complete = 1;
+                winFinishResponse(res);
             }
         } break;
 
@@ -1171,58 +2752,90 @@ callback(HINTERNET request, DWORD_PTR context, DWORD status, LPVOID statusInform
             DWORD* available = (DWORD*)statusInformation;
             res->bytesLeft = *available;
             if (res->bytesLeft == 0) {
-                res->complete = 1;
+                winFinishResponse(res);
                 break;
             }
 
             size_t bytesToRead = min(res->bytesLeft, sizeof(res->buffer));
             if (!WinHttpReadData(request, res->buffer, (DWORD)bytesToRead, NULL)) {
                 res->code = naettReadError;
-                res->complete = 1;
+                winFinishResponse(res);
             }
         } break;
 
         case WINHTTP_CALLBACK_STATUS_READ_COMPLETE: {
-            size_t bytesRead = statusInfoLength;
-
-            InternalRequest* req = res->request;
-            if (req->options.bodyWriter(res->buffer, (int)bytesRead, req->options.bodyWriterData) != bytesRead) {
+            if (statusInfoLength == 0 || statusInfoLength > sizeof(res->buffer) || statusInfoLength > res->bytesLeft) {
                 res->code = naettReadError;
-                res->complete = 1;
+                winFinishResponse(res);
+                break;
             }
-            res->totalBytesRead += (int)bytesRead;
+            int bytesRead = (int)statusInfoLength;
+            if (writeResponseBody(res, res->buffer, bytesRead) != bytesRead) {
+                res->code = res->sink || res->downloadFile ? naettWriteError : naettReadError;
+                winFinishResponse(res);
+                break;
+            }
+            recordResponseBytes(res, bytesRead);
             res->bytesLeft -= bytesRead;
             if (res->bytesLeft > 0) {
                 size_t bytesToRead = min(res->bytesLeft, sizeof(res->buffer));
                 if (!WinHttpReadData(request, res->buffer, (DWORD)bytesToRead, NULL)) {
                     res->code = naettReadError;
-                    res->complete = 1;
+                    winFinishResponse(res);
                 }
             } else {
                 if (!WinHttpQueryDataAvailable(request, NULL)) {
                     res->code = naettProtocolError;
-                    res->complete = 1;
+                    winFinishResponse(res);
                 }
             }
         } break;
 
         case WINHTTP_CALLBACK_STATUS_WRITE_COMPLETE:
         case WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE: {
-            int bytesRead = res->request->options.bodyReader(
-                res->buffer, sizeof(res->buffer), res->request->options.bodyReaderData);
-            if (bytesRead) {
-                WinHttpWriteData(request, res->buffer, bytesRead, NULL);
-            } else {
-                if (!WinHttpReceiveResponse(request, NULL)) {
-                    res->code = naettReadError;
-                    res->complete = 1;
+            if (status == WINHTTP_CALLBACK_STATUS_WRITE_COMPLETE) {
+                DWORD written = *(DWORD*)statusInformation;
+                if (written == 0 || written > res->uploadSize - res->uploadOffset) {
+                    res->code = naettWriteError;
+                    winFinishResponse(res);
+                    break;
                 }
+                DWORD previous = res->uploadOffset;
+                res->uploadOffset += written;
+                if (res->request->upload) {
+                    DWORD first = previous > res->uploadPayloadStart ? previous : res->uploadPayloadStart;
+                    DWORD end = res->uploadOffset < res->uploadPayloadEnd ? res->uploadOffset : res->uploadPayloadEnd;
+                    if (end > first) {
+                        InterlockedExchangeAdd64(&res->uploaded, end - first);
+                        if (res->cancellable) {
+                            signalActivity();
+                        }
+                    }
+                }
+            }
+            if (res->uploadOffset == res->uploadSize && !fillWinUpload(res)) {
+                res->code = naettReadError;
+                winFinishResponse(res);
+                break;
+            }
+            if (res->uploadSize != 0) {
+                if (!WinHttpWriteData(request, res->buffer + res->uploadStart + res->uploadOffset,
+                        res->uploadSize - res->uploadOffset, NULL)) {
+                    res->code = naettWriteError;
+                    winFinishResponse(res);
+                }
+            } else if (!WinHttpReceiveResponse(request, NULL) && !retryUpload(res, request, GetLastError())) {
+                res->code = naettReadError;
+                winFinishResponse(res);
             }
         } break;
 
         //
         case WINHTTP_CALLBACK_STATUS_REQUEST_ERROR: {
             WINHTTP_ASYNC_RESULT* result = (WINHTTP_ASYNC_RESULT*)statusInformation;
+            if (retryUpload(res, request, result->dwError)) {
+                break;
+            }
             switch (result->dwResult) {
                 case API_RECEIVE_RESPONSE:
                 case API_QUERY_DATA_AVAILABLE:
@@ -1239,9 +2852,30 @@ callback(HINTERNET request, DWORD_PTR context, DWORD status, LPVOID statusInform
                     res->code = naettGenericError;
             }
 
-            res->complete = 1;
+            winFinishResponse(res);
         } break;
     }
+}
+
+static int openWinRequest(InternalRequest* req) {
+    LPWSTR verb = winFromUTF8(req->options.method);
+    LPCWSTR version = req->upload && req->upload->unknownSize ? L"HTTP/1.1" : NULL;
+    HINTERNET request = WinHttpOpenRequest(req->connection, verb, req->resource, version, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES, req->secure ? WINHTTP_FLAG_SECURE : 0);
+    free(verb);
+    if (!request) {
+        return 0;
+    }
+    LPCWSTR headers = packHeaders(req);
+    int added = headers && (!headers[0] || WinHttpAddRequestHeaders(
+        request, headers, -1, WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE));
+    free((LPWSTR)headers);
+    if (!added) {
+        WinHttpCloseHandle(request);
+        return 0;
+    }
+    req->request = request;
+    return 1;
 }
 
 int naettPlatformInitRequest(InternalRequest* req) {
@@ -1263,14 +2897,23 @@ int naettPlatformInitRequest(InternalRequest* req) {
 
     req->host = wcsndup(components.lpszHostName, components.dwHostNameLength);
     req->resource = wcsndup(components.lpszUrlPath, components.dwUrlPathLength + components.dwExtraInfoLength);
+    req->secure = components.nScheme == INTERNET_SCHEME_HTTPS;
     free(url);
 
     LPWSTR uaBuf = winFromUTF8(req->options.userAgent ? req->options.userAgent : NAETT_UA);
     req->session = WinHttpOpen(uaBuf,
-        WINHTTP_ACCESS_TYPE_NO_PROXY,
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,
         WINHTTP_FLAG_ASYNC);
+    if (!req->session && GetLastError() == ERROR_INVALID_PARAMETER) {
+        // Older WinHTTP versions use the default proxy configuration.
+        req->session = WinHttpOpen(uaBuf,
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            WINHTTP_NO_PROXY_NAME,
+            WINHTTP_NO_PROXY_BYPASS,
+            WINHTTP_FLAG_ASYNC);
+    }
     free(uaBuf);
 
     if (!req->session) {
@@ -1278,6 +2921,18 @@ int naettPlatformInitRequest(InternalRequest* req) {
     }
 
     WinHttpSetStatusCallback(req->session, callback, WINHTTP_CALLBACK_FLAG_ALL_COMPLETIONS, 0);
+
+#ifdef WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL
+    if (req->upload && req->upload->unknownSize) {
+        DWORD protocols = 0;
+        if (!WinHttpSetOption(req->session, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL, &protocols, sizeof(protocols))) {
+            DWORD error = GetLastError();
+            if (error != ERROR_WINHTTP_INVALID_OPTION && error != ERROR_INVALID_PARAMETER) {
+                return 0;
+            }
+        }
+    }
+#endif
 
     // Set the connect timeout. Leave the other three timeouts at their default values.
     WinHttpSetTimeouts(req->session, 0, req->options.timeoutMS, 30000, 30000);
@@ -1288,49 +2943,103 @@ int naettPlatformInitRequest(InternalRequest* req) {
         return 0;
     }
 
-    LPWSTR verb = winFromUTF8(req->options.method);
-    req->request = WinHttpOpenRequest(req->connection,
-        verb,
-        req->resource,
-        NULL,
-        WINHTTP_NO_REFERER,
-        WINHTTP_DEFAULT_ACCEPT_TYPES,
-        components.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
-    free(verb);
-    if (!req->request) {
-        naettPlatformFreeRequest(req);
-        return 0;
+    return openWinRequest(req);
+}
+
+static void winSendRequest(InternalResponse* res, HINTERNET request) {
+    InternalRequest* req = res->request;
+    if (res->cancellable && InterlockedCompareExchange(&res->streamClosing, 0, 0)) {
+        return;
     }
 
-    LPCWSTR headers = packHeaders(req);
-    if (headers[0] != 0) {
-        if (!WinHttpAddRequestHeaders(
-                req->request, headers, -1, WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE)) {
-            naettPlatformFreeRequest(req);
-            free((LPWSTR)headers);
-            return 0;
+    LPCWSTR extraHeaders = WINHTTP_NO_ADDITIONAL_HEADERS;
+    WCHAR contentLengthHeader[64];
+    DWORD totalLength = 0;
+    if (req->upload) {
+        if (!resetUpload(res)) {
+            res->code = naettReadError;
+            winFinishResponse(res);
+            return;
+        }
+        res->uploadSize = 0;
+        res->uploadOffset = 0;
+        res->uploadEnded = 0;
+        InterlockedExchange64(&res->uploaded, 0);
+        if (req->upload->unknownSize) {
+            if (!WinHttpAddRequestHeaders(request, L"Transfer-Encoding: chunked\r\n", (DWORD)-1,
+                    WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE)) {
+                res->code = naettProtocolError;
+                winFinishResponse(res);
+                return;
+            }
+            totalLength = WINHTTP_IGNORE_REQUEST_TOTAL_LENGTH;
+        } else if (req->upload->size <= MAXDWORD) {
+            totalLength = (DWORD)req->upload->size;
+        } else {
+            swprintf(contentLengthHeader, 64, L"Content-Length: %llu", (unsigned long long)req->upload->size);
+            extraHeaders = contentLengthHeader;
+            totalLength = WINHTTP_IGNORE_REQUEST_TOTAL_LENGTH;
+        }
+    } else {
+        int contentLength = req->options.bodyReader(NULL, 0, req->options.bodyReaderData);
+        if (contentLength > 0) {
+            swprintf(contentLengthHeader, 64, L"Content-Length: %d", contentLength);
+            extraHeaders = contentLengthHeader;
         }
     }
-    free((LPWSTR)headers);
 
-    return 1;
+    if (!WinHttpSendRequest(request, extraHeaders, -1, NULL, 0, totalLength, (DWORD_PTR)res) &&
+        !retryUpload(res, request, GetLastError())) {
+        res->code = naettConnectionError;
+        winFinishResponse(res);
+    }
+}
+
+static unsigned int __stdcall startWinRequest(void* context) {
+    InternalResponse* res = context;
+    if (!InterlockedCompareExchange(&res->cancelRequested, 0, 0)) {
+        winSendRequest(res, res->request->request);
+    }
+    InterlockedExchange(&res->starterDone, 1);
+    if (InterlockedCompareExchange(&res->cancelRequested, 0, 0)) {
+        winFinishResponse(res);
+    }
+    return 0;
 }
 
 void naettPlatformMakeRequest(InternalResponse* res) {
     InternalRequest* req = res->request;
-
-    LPCWSTR extraHeaders = WINHTTP_NO_ADDITIONAL_HEADERS;
-    WCHAR contentLengthHeader[64];
-
-    int contentLength = req->options.bodyReader(NULL, 0, req->options.bodyReaderData);
-    if (contentLength > 0) {
-        swprintf(contentLengthHeader, 64, L"Content-Length: %d", contentLength);
-        extraHeaders = contentLengthHeader;
-    }
-
-    if (!WinHttpSendRequest(req->request, extraHeaders, -1, NULL, 0, 0, (DWORD_PTR)res)) {
+    if (!req->request && !openWinRequest(req)) {
         res->code = naettConnectionError;
-        res->complete = 1;
+        finishResponse(res);
+        return;
+    }
+    HINTERNET request = req->request;
+    if (res->cancellable) {
+        DWORD_PTR context = (DWORD_PTR)res;
+        if (!WinHttpSetOption(request, WINHTTP_OPTION_CONTEXT_VALUE, &context, sizeof(context)) ||
+            WinHttpSetStatusCallback(request, callback,
+                WINHTTP_CALLBACK_FLAG_ALL_COMPLETIONS | WINHTTP_CALLBACK_FLAG_HANDLES, 0) ==
+            WINHTTP_INVALID_STATUS_CALLBACK) {
+            res->code = naettGenericError;
+            finishResponse(res);
+            return;
+        }
+        // WinHTTP may invoke its first callback before WinHttpSendRequest returns.
+        res->requestStarter = (HANDLE)_beginthreadex(NULL, 0, startWinRequest, res, 0, NULL);
+        if (!res->requestStarter) {
+            res->code = naettGenericError;
+            winFinishResponse(res);
+        }
+    } else {
+        winSendRequest(res, request);
+    }
+}
+
+void naettPlatformCancel(InternalResponse* res) {
+    InterlockedExchange(&res->cancelRequested, 1);
+    if (!res->requestStarter || InterlockedCompareExchange(&res->starterDone, 0, 0)) {
+        winFinishResponse(res);
     }
 }
 
@@ -1360,6 +3069,10 @@ void naettPlatformFreeRequest(InternalRequest* req) {
 }
 
 void naettPlatformCloseResponse(InternalResponse* res) {
+    if (res->requestStarter) {
+        WaitForSingleObject(res->requestStarter, INFINITE);
+        CloseHandle(res->requestStarter);
+    }
 }
 
 #endif  // __WINDOWS__
